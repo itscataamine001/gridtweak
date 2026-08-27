@@ -1,0 +1,9 @@
+﻿fastapi
+uvicorn
+apscheduler
+lightgbm
+scikit-learn
+pandas
+numpy
+requests
+python-multipart

@@ -1,0 +1,12 @@
+
+services:
+  - type: web
+    name: gridtweak
+    runtime: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: python dlr_v28.py --api --config config.json --port $PORT
+    healthCheckPath: /
+    envVars:
+      - key: PYTHONUNBUFFERED
+        value: 1
