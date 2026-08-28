@@ -12,7 +12,7 @@ Wind Speed Clamp + Weighted Smoothing + Correction Factor applied.
 DLR Scaling Factor for safety margin.
 Location name displayed on dashboard.
 Favicon loaded from favicon_base64.txt (if present).
-Forecast: reduced days, User‑Agent, exponential backoff.
+Forecast: cached on startup and served from memory.
 """
 
 import argparse
@@ -69,6 +69,15 @@ try:
     ML_AVAILABLE = True
 except ImportError:
     pass
+
+# ============================================================================
+# GLOBAL FORECAST CACHE
+# ============================================================================
+
+_cached_forecast = {
+    "data": None,
+    "last_updated": None
+}
 
 # ============================================================================
 # CONFIGURATION
@@ -411,7 +420,6 @@ def apply_wind_correction(records: List[WeatherRecord], config: Dict) -> List[We
     return records
 
 def fetch_weather_from_openmeteo(lat, lon, start_date, end_date, timezone="auto", forecast=False):
-    # Use a simpler, more reliable request with User-Agent and fewer forecast days
     if forecast:
         base_url = "https://api.open-meteo.com/v1/forecast"
         params = {"latitude": lat, "longitude": lon,
@@ -501,7 +509,6 @@ def fetch_weather_from_openmeteo(lat, lon, start_date, end_date, timezone="auto"
         except Exception as e:
             print(f"Warning: date filtering failed: {e}")
     
-    # Apply wind correction
     records = apply_wind_correction(records, CONFIG_DEFAULTS)
     return records
 
@@ -525,6 +532,77 @@ def fetch_weather_multi_year(lat, lon, start_date, end_date):
             print(f"  Error fetching {year}: {e}")
             raise
     return all_records
+
+# ============================================================================
+# FORECAST CACHE UPDATE
+# ============================================================================
+
+def update_forecast_cache():
+    """Fetch forecast and store in global cache."""
+    global _cached_forecast
+    try:
+        print("🌤️ Updating forecast cache...")
+        lat = CONFIG_DEFAULTS["lat"]
+        lon = CONFIG_DEFAULTS["lon"]
+        conductor = get_conductor(CONFIG_DEFAULTS["conductor"])
+        days = 7
+        start_date = datetime.now().strftime("%Y-%m-%d")
+        end_date = (datetime.now() + timedelta(days=days)).strftime("%Y-%m-%d")
+        
+        weather = fetch_weather_from_openmeteo(lat, lon, start_date, end_date, forecast=True)
+        if not weather:
+            print("⚠️ Forecast cache update: no weather data returned.")
+            return
+        
+        results = []
+        for w in weather:
+            try:
+                dt = datetime.fromisoformat(w.timestamp)
+                hour = dt.hour
+            except:
+                hour = 12
+            sp = solar_position(hour)
+            geo = wind_geometry(w.wind_mps, w.wind_direction_deg, LINE_AZIMUTH_DEG)
+            wind_perp = geo["perpendicular_ms"]
+            attack_deg = geo["attack_angle_deg"]
+            
+            dlr = solve_dlr(w.ambient_c, wind_perp, w.ghi_w_m2, sp["altitude_deg"], sp["azimuth_deg"],
+                            conductor, LINE_AZIMUTH_DEG, attack_deg,
+                            CONFIG_DEFAULTS["convection_model"], ROUGHNESS_M, TURB_INTENSITY)
+            scaling = CONFIG_DEFAULTS.get("dlr_scaling_factor", 1.0)
+            dlr = dlr * scaling
+            
+            temp_res = solve_temperature(CONFIG_DEFAULTS["test_current"], w.ambient_c, wind_perp, w.ghi_w_m2,
+                                         sp["altitude_deg"], sp["azimuth_deg"],
+                                         conductor, LINE_AZIMUTH_DEG, attack_deg,
+                                         CONFIG_DEFAULTS["convection_model"], ROUGHNESS_M, TURB_INTENSITY)
+            voltage = CONFIG_DEFAULTS.get("nominal_voltage_kv", 220)
+            pf = CONFIG_DEFAULTS.get("power_factor", 0.9)
+            mw = amps_to_mw(dlr, voltage, pf)
+            sag_m = calculate_sag(
+                temp_res["temperature_c"],
+                conductor,
+                CONFIG_DEFAULTS.get("span_length_m", 400),
+                ref_temp=CONFIG_DEFAULTS.get("ref_temp_sag", 20.0),
+                sag_ref=CONFIG_DEFAULTS.get("sag_ref_m", 5.0)
+            )
+            results.append({
+                "timestamp": w.timestamp,
+                "dlr_a": dlr,
+                "dlr_mw": mw,
+                "temperature_c": temp_res["temperature_c"],
+                "ambient_c": w.ambient_c,
+                "wind_mps": w.wind_mps,
+                "ghi_w_m2": w.ghi_w_m2,
+                "sag_m": sag_m,
+                "status": "OK" if temp_res["temperature_c"] <= conductor.tmax_c else "OVER"
+            })
+        
+        _cached_forecast["data"] = results
+        _cached_forecast["last_updated"] = datetime.now().isoformat()
+        print(f"✅ Forecast cache updated: {len(results)} records at {_cached_forecast['last_updated']}")
+    except Exception as e:
+        print(f"❌ Forecast cache update failed: {e}")
 
 # ============================================================================
 # ML MODEL LOADING
@@ -984,65 +1062,22 @@ if app is not None:
         return JSONResponse(content=runs)
 
     @app.get("/dlr/forecast")
-    async def get_forecast(days: int = Query(7, ge=1, le=7)):  # force days 1-7
-        lat = CONFIG_DEFAULTS["lat"]
-        lon = CONFIG_DEFAULTS["lon"]
-        conductor = get_conductor(CONFIG_DEFAULTS["conductor"])
-        start_date = datetime.now().strftime("%Y-%m-%d")
-        end_date = (datetime.now() + timedelta(days=days)).strftime("%Y-%m-%d")
-        try:
-            weather = fetch_weather_from_openmeteo(lat, lon, start_date, end_date, forecast=True)
-        except Exception as e:
-            print(f"❌ Forecast fetch failed: {e}")
-            raise HTTPException(status_code=500, detail=f"Forecast service unavailable: {str(e)}")
-        
-        # If no forecast data, return empty array gracefully
-        if not weather:
-            return JSONResponse(content={"forecast": []})
-            
-        results = []
-        for w in weather:
+    async def get_forecast():
+        """Return cached forecast data instantly."""
+        global _cached_forecast
+        if _cached_forecast["data"] is None:
+            # Try to update cache on first request (fallback)
+            print("⚠️ Forecast cache empty, attempting to fetch...")
             try:
-                dt = datetime.fromisoformat(w.timestamp)
-                hour = dt.hour
-            except:
-                hour = 12
-            sp = solar_position(hour)
-            geo = wind_geometry(w.wind_mps, w.wind_direction_deg, LINE_AZIMUTH_DEG)
-            wind_perp = geo["perpendicular_ms"]
-            attack_deg = geo["attack_angle_deg"]
-            dlr = solve_dlr(w.ambient_c, wind_perp, w.ghi_w_m2, sp["altitude_deg"], sp["azimuth_deg"],
-                            conductor, LINE_AZIMUTH_DEG, attack_deg,
-                            CONFIG_DEFAULTS["convection_model"], ROUGHNESS_M, TURB_INTENSITY)
-            # Apply scaling to forecast too
-            scaling = CONFIG_DEFAULTS.get("dlr_scaling_factor", 1.0)
-            dlr = dlr * scaling
-            temp_res = solve_temperature(CONFIG_DEFAULTS["test_current"], w.ambient_c, wind_perp, w.ghi_w_m2,
-                                         sp["altitude_deg"], sp["azimuth_deg"],
-                                         conductor, LINE_AZIMUTH_DEG, attack_deg,
-                                         CONFIG_DEFAULTS["convection_model"], ROUGHNESS_M, TURB_INTENSITY)
-            voltage = CONFIG_DEFAULTS.get("nominal_voltage_kv", 220)
-            pf = CONFIG_DEFAULTS.get("power_factor", 0.9)
-            mw = amps_to_mw(dlr, voltage, pf)
-            sag_m = calculate_sag(
-                temp_res["temperature_c"],
-                conductor,
-                CONFIG_DEFAULTS.get("span_length_m", 400),
-                ref_temp=CONFIG_DEFAULTS.get("ref_temp_sag", 20.0),
-                sag_ref=CONFIG_DEFAULTS.get("sag_ref_m", 5.0)
-            )
-            results.append({
-                "timestamp": w.timestamp,
-                "dlr_a": dlr,
-                "dlr_mw": mw,
-                "temperature_c": temp_res["temperature_c"],
-                "ambient_c": w.ambient_c,
-                "wind_mps": w.wind_mps,
-                "ghi_w_m2": w.ghi_w_m2,
-                "sag_m": sag_m,
-                "status": "OK" if temp_res["temperature_c"] <= conductor.tmax_c else "OVER"
-            })
-        return JSONResponse(content={"forecast": results})
+                update_forecast_cache()
+            except Exception as e:
+                print(f"❌ Fallback forecast fetch failed: {e}")
+                return JSONResponse(content={"forecast": []})
+        
+        if _cached_forecast["data"] is None:
+            return JSONResponse(content={"forecast": []})
+        
+        return JSONResponse(content={"forecast": _cached_forecast["data"]})
 
     @app.get("/dlr/corridor")
     async def get_corridor():
@@ -1157,7 +1192,6 @@ if app is not None:
         if favicon_base64:
             favicon_tag = f'<link rel="icon" href="data:image/x-icon;base64,{favicon_base64}" type="image/x-icon">'
         else:
-            # Minimal fallback icon (empty)
             favicon_tag = '<link rel="icon" href="data:,">'
 
         html = f"""
@@ -1516,10 +1550,9 @@ if app is not None:
         histChart.update();
     }}
 
-    // ---------- FIXED fetchForecast() ----------
     async function fetchForecast() {{
         try {{
-            const resp = await fetch('/dlr/forecast?days=7');
+            const resp = await fetch('/dlr/forecast');
             if (!resp.ok) {{
                 const errText = await resp.text();
                 console.error('Forecast API error:', resp.status, errText);
@@ -1527,7 +1560,7 @@ if app is not None:
                 return;
             }}
             const data = await resp.json();
-            console.log('✅ Forecast data:', data);
+            console.log('✅ Forecast data (cached):', data);
             if (!data || !data.forecast || data.forecast.length === 0) {{
                 document.getElementById('forecastTable').innerHTML = '<p>No forecast data available for this location.</p>';
                 return;
@@ -1567,7 +1600,6 @@ if app is not None:
             document.getElementById('forecastTable').innerHTML = `<p style="color:red;">⚠️ Failed to load forecast: ${{e.message}}</p>`;
         }}
     }}
-    // ---------- END OF FIXED fetchForecast() ----------
 
     async function fetchCorridor() {{
         try {{
@@ -1725,8 +1757,29 @@ def main():
         if not API_AVAILABLE:
             print("FastAPI not installed. Install with: pip install fastapi uvicorn")
             return 1
+        
         print(f"Starting {APP_NAME} API server at http://localhost:{args.port}")
         print(f"Dashboard: http://localhost:{args.port}/dashboard")
+        
+        # ✅ Populate forecast cache on startup
+        print("🌤️ Pre-fetching forecast cache on startup...")
+        try:
+            update_forecast_cache()
+        except Exception as e:
+            print(f"⚠️ Initial forecast cache failed: {e}")
+        
+        # ✅ Schedule periodic forecast cache refresh (every 6 hours)
+        if SCHEDULER_AVAILABLE:
+            try:
+                scheduler = BackgroundScheduler()
+                scheduler.add_job(update_forecast_cache, 'interval', hours=6, id='forecast_cache_job')
+                scheduler.start()
+                print("🔄 Forecast cache will refresh every 6 hours.")
+            except Exception as e:
+                print(f"⚠️ Could not start scheduler: {e}")
+        else:
+            print("ℹ️ APScheduler not available. Forecast cache will not auto-refresh.")
+        
         uvicorn.run(app, host="0.0.0.0", port=args.port)
         return 0
 
