@@ -1516,13 +1516,14 @@ if app is not None:
         histChart.update();
     }}
 
+    // ---------- FIXED fetchForecast() ----------
     async function fetchForecast() {{
         try {{
             const resp = await fetch('/dlr/forecast?days=7');
             if (!resp.ok) {{
                 const errText = await resp.text();
                 console.error('Forecast API error:', resp.status, errText);
-                document.getElementById('forecastTable').innerHTML = `<p style="color:red;">⚠️ Forecast unavailable (${resp.status})</p>`;
+                document.getElementById('forecastTable').innerHTML = `<p style="color:red;">⚠️ Forecast unavailable (${{resp.status}})</p>`;
                 return;
             }}
             const data = await resp.json();
@@ -1566,6 +1567,7 @@ if app is not None:
             document.getElementById('forecastTable').innerHTML = `<p style="color:red;">⚠️ Failed to load forecast: ${{e.message}}</p>`;
         }}
     }}
+    // ---------- END OF FIXED fetchForecast() ----------
 
     async function fetchCorridor() {{
         try {{
