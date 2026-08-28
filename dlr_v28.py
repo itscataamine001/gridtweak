@@ -12,7 +12,7 @@ Wind Speed Clamp + Weighted Smoothing + Correction Factor applied.
 DLR Scaling Factor for safety margin.
 Location name displayed on dashboard.
 Favicon loaded from favicon_base64.txt (if present).
-Forecast: cached on startup and served from memory.
+Forecast: file‑based caching (persistent across restarts) – Open‑Meteo only called every 6 hours.
 """
 
 import argparse
@@ -78,6 +78,38 @@ _cached_forecast = {
     "data": None,
     "last_updated": None
 }
+
+FORECAST_CACHE_FILE = "forecast_cache.json"
+
+def load_forecast_cache_from_file():
+    """Load cached forecast from disk on startup."""
+    global _cached_forecast
+    if os.path.exists(FORECAST_CACHE_FILE):
+        try:
+            with open(FORECAST_CACHE_FILE, 'r') as f:
+                data = json.load(f)
+                _cached_forecast["data"] = data.get("data")
+                _cached_forecast["last_updated"] = data.get("last_updated")
+                record_count = len(_cached_forecast['data']) if _cached_forecast['data'] else 0
+                print(f"✅ Loaded forecast cache from disk ({record_count} records, updated {_cached_forecast['last_updated']})")
+                return True
+        except Exception as e:
+            print(f"⚠️ Could not load forecast cache from disk: {e}")
+    return False
+
+def save_forecast_cache_to_file():
+    """Save cached forecast to disk."""
+    global _cached_forecast
+    try:
+        with open(FORECAST_CACHE_FILE, 'w') as f:
+            json.dump({
+                "data": _cached_forecast["data"],
+                "last_updated": _cached_forecast["last_updated"]
+            }, f)
+        record_count = len(_cached_forecast['data']) if _cached_forecast['data'] else 0
+        print(f"💾 Forecast cache saved to disk ({record_count} records)")
+    except Exception as e:
+        print(f"⚠️ Could not save forecast cache to disk: {e}")
 
 # ============================================================================
 # CONFIGURATION
@@ -538,10 +570,22 @@ def fetch_weather_multi_year(lat, lon, start_date, end_date):
 # ============================================================================
 
 def update_forecast_cache():
-    """Fetch forecast and store in global cache."""
+    """Fetch forecast from Open-Meteo and store in memory + disk. Only fetches if cache is stale."""
     global _cached_forecast
+    
+    # Check if cache is fresh (less than 6 hours old)
+    if _cached_forecast["last_updated"]:
+        try:
+            last_updated = datetime.fromisoformat(_cached_forecast["last_updated"])
+            age = (datetime.now() - last_updated).total_seconds() / 3600
+            if age < 6:
+                print(f"⏭️ Forecast cache is fresh ({age:.1f} hours old). Skipping fetch.")
+                return
+        except:
+            pass  # If parsing fails, proceed to fetch
+    
     try:
-        print("🌤️ Updating forecast cache...")
+        print("🌤️ Updating forecast cache from Open-Meteo...")
         lat = CONFIG_DEFAULTS["lat"]
         lon = CONFIG_DEFAULTS["lon"]
         conductor = get_conductor(CONFIG_DEFAULTS["conductor"])
@@ -551,9 +595,12 @@ def update_forecast_cache():
         
         weather = fetch_weather_from_openmeteo(lat, lon, start_date, end_date, forecast=True)
         if not weather:
-            print("⚠️ Forecast cache update: no weather data returned.")
+            print("⚠️ Open-Meteo returned no data. Keeping old cache.")
             return
         
+        print(f"✅ Open-Meteo forecast fetched ({len(weather)} records)")
+        
+        # Process weather into DLR results
         results = []
         for w in weather:
             try:
@@ -598,11 +645,16 @@ def update_forecast_cache():
                 "status": "OK" if temp_res["temperature_c"] <= conductor.tmax_c else "OVER"
             })
         
+        # Update memory cache
         _cached_forecast["data"] = results
         _cached_forecast["last_updated"] = datetime.now().isoformat()
+        
+        # Save to disk
+        save_forecast_cache_to_file()
+        
         print(f"✅ Forecast cache updated: {len(results)} records at {_cached_forecast['last_updated']}")
     except Exception as e:
-        print(f"❌ Forecast cache update failed: {e}")
+        print(f"❌ Forecast cache update failed: {e}. Keeping old cache.")
 
 # ============================================================================
 # ML MODEL LOADING
@@ -1761,20 +1813,34 @@ def main():
         print(f"Starting {APP_NAME} API server at http://localhost:{args.port}")
         print(f"Dashboard: http://localhost:{args.port}/dashboard")
         
-        # ✅ Populate forecast cache on startup
-        print("🌤️ Pre-fetching forecast cache on startup...")
-        try:
-            update_forecast_cache()
-        except Exception as e:
-            print(f"⚠️ Initial forecast cache failed: {e}")
+        # --- Load forecast cache from disk (instant, no API call) ---
+        cache_loaded = load_forecast_cache_from_file()
         
-        # ✅ Schedule periodic forecast cache refresh (every 6 hours)
+        # --- If cache is missing or very old, trigger a background update ---
+        if not cache_loaded:
+            print("🌤️ No disk cache found. Attempting initial fetch...")
+            try:
+                update_forecast_cache()
+            except Exception as e:
+                print(f"⚠️ Initial forecast fetch failed: {e}")
+        else:
+            # Check if cache is stale (> 6 hours) and update in background later
+            try:
+                if _cached_forecast["last_updated"]:
+                    last_updated = datetime.fromisoformat(_cached_forecast["last_updated"])
+                    age = (datetime.now() - last_updated).total_seconds() / 3600
+                    if age > 6:
+                        print(f"⏳ Disk cache is {age:.1f} hours old. Will refresh on next scheduled run.")
+            except:
+                pass
+        
+        # --- Schedule periodic refresh (every 6 hours) ---
         if SCHEDULER_AVAILABLE:
             try:
                 scheduler = BackgroundScheduler()
                 scheduler.add_job(update_forecast_cache, 'interval', hours=6, id='forecast_cache_job')
                 scheduler.start()
-                print("🔄 Forecast cache will refresh every 6 hours.")
+                print("🔄 Forecast cache will refresh every 6 hours (if needed).")
             except Exception as e:
                 print(f"⚠️ Could not start scheduler: {e}")
         else:
