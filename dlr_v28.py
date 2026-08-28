@@ -11,6 +11,7 @@ Zebra/Panther conductors added.
 Wind Speed Clamp + Weighted Smoothing + Correction Factor applied.
 DLR Scaling Factor for safety margin.
 Location name displayed on dashboard.
+Favicon loaded from favicon_base64.txt (if present).
 """
 
 import argparse
@@ -78,7 +79,7 @@ APP_NAME = "GridTweak"
 CONFIG_DEFAULTS = {
     "lat": 19.076,
     "lon": 72.877,
-    "location_name": "MSETCL – 220kV Trombay-Vikhroli",  # <-- NEW
+    "location_name": "MSETCL – 220kV Trombay-Vikhroli",
     "conductor": "panther",
     "convection_model": "ieee738",
     "test_current": 1000,
@@ -1110,11 +1111,29 @@ if app is not None:
             raise HTTPException(status_code=500, detail=str(e))
 
     # ========================================================================
-    # DASHBOARD HTML
+    # DASHBOARD HTML (with favicon from external file)
     # ========================================================================
     @app.get("/dashboard", response_class=HTMLResponse)
     async def dashboard():
         location = CONFIG_DEFAULTS.get("location_name", "Transmission Line")
+
+        # Read favicon base64 from file if it exists
+        favicon_base64 = ""
+        favicon_path = Path("favicon_base64.txt")
+        if favicon_path.exists():
+            try:
+                with open(favicon_path, "r") as f:
+                    favicon_base64 = f.read().strip()
+            except Exception as e:
+                print(f"Warning: Could not read favicon file: {e}")
+
+        favicon_tag = ""
+        if favicon_base64:
+            favicon_tag = f'<link rel="icon" href="data:image/x-icon;base64,{favicon_base64}" type="image/x-icon">'
+        else:
+            # Minimal fallback icon (empty)
+            favicon_tag = '<link rel="icon" href="data:,">'
+
         html = f"""
 <!DOCTYPE html>
 <html lang="en">
@@ -1122,6 +1141,7 @@ if app is not None:
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>GridTweak – DLR Intelligence</title>
+    {favicon_tag}
     <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
     <style>
         * {{ margin: 0; padding: 0; box-sizing: border-box; }}
