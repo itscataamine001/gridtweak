@@ -5,6 +5,12 @@
 GridTweak DLR Engine - V28 (Production Dashboard)
 ------------------------------------------------
 Full DLR engine with corridor, sag, and auto‑computed static rating.
+Root URL redirects to /dashboard.
+Historical data is limited to 24 hours.
+Zebra/Panther conductors added.
+Wind Speed Clamp + Weighted Smoothing + Correction Factor applied.
+DLR Scaling Factor for safety margin.
+Location name displayed on dashboard.
 """
 
 import argparse
@@ -41,7 +47,7 @@ try:
     import fastapi
     import uvicorn
     from fastapi import FastAPI, Query, HTTPException
-    from fastapi.responses import HTMLResponse, JSONResponse
+    from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
     API_AVAILABLE = True
 except ImportError:
     API_AVAILABLE = False
@@ -72,9 +78,10 @@ APP_NAME = "GridTweak"
 CONFIG_DEFAULTS = {
     "lat": 19.076,
     "lon": 72.877,
-    "conductor": "drake",
+    "location_name": "MSETCL – 220kV Trombay-Vikhroli",  # <-- NEW
+    "conductor": "panther",
     "convection_model": "ieee738",
-    "test_current": 1200,
+    "test_current": 1000,
     "thresholds": [1200, 1500, 2000, 2500, 3000],
     "alert_threshold_dlr": 2500,
     "alert_threshold_temp": 80,
@@ -92,18 +99,21 @@ CONFIG_DEFAULTS = {
     "use_ml": True,
     "nominal_voltage_kv": 220,
     "power_factor": 0.9,
-    # Static rating override (if None, we compute automatically)
-    "static_rating_mw": None,
-    # Corridor
+    "static_rating_mw": 600,
     "num_segments": 3,
     "end_lat": None,
     "end_lon": None,
     "corridor_mode": False,
-    # Sag
     "span_length_m": 400,
     "sag_ref_m": 5.0,
     "thermal_expansion_coeff": 23e-6,
     "ref_temp_sag": 20.0,
+    # --- WIND CORRECTION SETTINGS ---
+    "wind_max_mps": 7.0,
+    "wind_smoothing_window": 3,
+    "wind_correction_factor": 0.35,
+    # --- DLR CALIBRATION SETTINGS ---
+    "dlr_scaling_factor": 0.80
 }
 
 # ============================================================================
@@ -126,6 +136,9 @@ CONDUCTOR_LIBRARY = {
     "cardinal": Conductor("954 kcmil 54/7 Cardinal ACSR", 0.03038, 8.90e-6, 0.00403, 0.50, 0.50, 100.0),
     "linnet": Conductor("336.4 kcmil 26/7 Linnet ACSR", 0.01849, 2.58e-5, 0.00403, 0.50, 0.50, 100.0),
     "rail": Conductor("1033.5 kcmil 54/7 Rail ACSR", 0.03208, 8.22e-6, 0.00403, 0.50, 0.50, 100.0),
+    "zebra": Conductor("Zebra ACSR (India)", 0.03175, 8.50e-6, 0.00403, 0.50, 0.50, 100.0),
+    "panther": Conductor("Panther ACSR", 0.02538, 1.29e-5, 0.00403, 0.50, 0.50, 100.0),
+    "moose": Conductor("Moose ACSR", 0.03315, 7.20e-6, 0.00403, 0.50, 0.50, 100.0),
 }
 
 def get_conductor(name, overrides=None):
@@ -326,27 +339,19 @@ def calculate_sag(conductor_temp_c, conductor, span_length_m, ref_temp=20.0, sag
 # ============================================================================
 
 def compute_static_rating(conductor, line_azimuth_deg=90.0, convection_model="ieee738"):
-    """
-    Compute static rating using conservative weather:
-        ambient 40°C, wind 0.6 m/s, full solar (GHI 1000 W/m²),
-        and maximum solar heating (altitude 90°, azimuth 180°).
-    This gives a worst‑case, IEEE 738‑based static rating.
-    """
     ambient = 40.0
     wind = 0.6
     ghi = 1000.0
     solar_alt = 90.0
     solar_az = 180.0
-    # Perpendicular wind: wind is full, but we can set attack_angle=90°
     attack_angle = 90.0
-    # Compute DLR under these conditions
     dlr = solve_dlr(ambient, wind, ghi, solar_alt, solar_az,
                     conductor, line_azimuth_deg, attack_angle,
                     convection_model, ROUGHNESS_M, TURB_INTENSITY)
     return dlr
 
 # ============================================================================
-# WEATHER FETCH
+# WEATHER FETCH & CORRECTION
 # ============================================================================
 
 @dataclass
@@ -356,6 +361,52 @@ class WeatherRecord:
     wind_mps: float
     wind_direction_deg: float
     ghi_w_m2: float
+
+def apply_wind_correction(records: List[WeatherRecord], config: Dict) -> List[WeatherRecord]:
+    if not records:
+        return records
+
+    window = config.get("wind_smoothing_window", 3)
+    max_mps = config.get("wind_max_mps", 8.0)
+    factor = config.get("wind_correction_factor", 1.0)
+
+    if window < 1:
+        window = 1
+
+    if factor != 1.0:
+        for r in records:
+            r.wind_mps = r.wind_mps * factor
+
+    n = len(records)
+    smoothed_winds = [0.0] * n
+
+    if window % 2 == 0:
+        window += 1
+    half = window // 2
+    weights = []
+    for i in range(-half, half + 1):
+        weight = half + 1 - abs(i)
+        weights.append(weight)
+    weight_sum = sum(weights)
+
+    for i in range(n):
+        total = 0.0
+        w_sum = 0.0
+        for j, w in enumerate(weights):
+            idx = i + (j - half)
+            if 0 <= idx < n:
+                total += records[idx].wind_mps * w
+                w_sum += w
+        smoothed = total / w_sum if w_sum > 0 else records[i].wind_mps
+        if smoothed > max_mps:
+            smoothed = max_mps
+        smoothed_winds[i] = smoothed
+
+    for i, r in enumerate(records):
+        r.wind_mps = smoothed_winds[i]
+
+    print(f"🔧 Wind Correction Applied: Factor={factor}, Max={max_mps}m/s, Window={window}hrs")
+    return records
 
 def fetch_weather_from_openmeteo(lat, lon, start_date, end_date, timezone="auto", forecast=False):
     if forecast:
@@ -429,6 +480,8 @@ def fetch_weather_from_openmeteo(lat, lon, start_date, end_date, timezone="auto"
             records = filtered
         except Exception as e:
             print(f"Warning: date filtering failed: {e}")
+
+    records = apply_wind_correction(records, CONFIG_DEFAULTS)
     return records
 
 def fetch_weather_multi_year(lat, lon, start_date, end_date):
@@ -560,6 +613,10 @@ def run_dlr_for_period_segment(weather_records, conductor, convection_model,
                                          sp["altitude_deg"], sp["azimuth_deg"],
                                          conductor, LINE_AZIMUTH_DEG, attack_deg,
                                          convection_model, ROUGHNESS_M, TURB_INTENSITY)
+
+        # ✅ Apply DLR scaling factor
+        scaling = CONFIG_DEFAULTS.get("dlr_scaling_factor", 1.0)
+        dlr = dlr * scaling
 
         margin_c = conductor.tmax_c - temp_res["temperature_c"]
         status = "OK" if temp_res["temperature_c"] <= conductor.tmax_c else "OVER"
@@ -878,11 +935,13 @@ if app is not None:
         run = get_latest_run(db_path)
         if not run:
             raise HTTPException(status_code=404, detail="No data available")
+        results = run["results"]
+        if len(results) > 24:
+            results = results[-24:]
+        run["results"] = results
         voltage = CONFIG_DEFAULTS.get("nominal_voltage_kv", 220)
         pf = CONFIG_DEFAULTS.get("power_factor", 0.9)
         run["results"] = enrich_with_mw(run["results"], voltage, pf)
-
-        # Compute static rating if not overridden
         conductor = get_conductor(CONFIG_DEFAULTS["conductor"])
         static_mw_override = CONFIG_DEFAULTS.get("static_rating_mw")
         if static_mw_override is not None:
@@ -890,7 +949,6 @@ if app is not None:
         else:
             static_rating_amp = compute_static_rating(conductor, LINE_AZIMUTH_DEG, CONFIG_DEFAULTS["convection_model"])
             static_rating_mw = amps_to_mw(static_rating_amp, voltage, pf)
-
         run["static_rating_mw"] = static_rating_mw
         return JSONResponse(content=run)
 
@@ -929,6 +987,9 @@ if app is not None:
             dlr = solve_dlr(w.ambient_c, wind_perp, w.ghi_w_m2, sp["altitude_deg"], sp["azimuth_deg"],
                             conductor, LINE_AZIMUTH_DEG, attack_deg,
                             CONFIG_DEFAULTS["convection_model"], ROUGHNESS_M, TURB_INTENSITY)
+            # Apply scaling to forecast too
+            scaling = CONFIG_DEFAULTS.get("dlr_scaling_factor", 1.0)
+            dlr = dlr * scaling
             temp_res = solve_temperature(CONFIG_DEFAULTS["test_current"], w.ambient_c, wind_perp, w.ghi_w_m2,
                                          sp["altitude_deg"], sp["azimuth_deg"],
                                          conductor, LINE_AZIMUTH_DEG, attack_deg,
@@ -956,7 +1017,6 @@ if app is not None:
             })
         return JSONResponse(content={"forecast": results})
 
-    # --- CORRIDOR endpoints (unchanged) ---
     @app.get("/dlr/corridor")
     async def get_corridor():
         try:
@@ -1050,11 +1110,12 @@ if app is not None:
             raise HTTPException(status_code=500, detail=str(e))
 
     # ========================================================================
-    # PRODUCTION DASHBOARD (dynamic static rating)
+    # DASHBOARD HTML
     # ========================================================================
     @app.get("/dashboard", response_class=HTMLResponse)
     async def dashboard():
-        html = """
+        location = CONFIG_DEFAULTS.get("location_name", "Transmission Line")
+        html = f"""
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -1063,31 +1124,31 @@ if app is not None:
     <title>GridTweak – DLR Intelligence</title>
     <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
     <style>
-        * { margin: 0; padding: 0; box-sizing: border-box; }
-        body {
+        * {{ margin: 0; padding: 0; box-sizing: border-box; }}
+        body {{
             font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
             background: #f6f9fc;
             color: #1a2634;
             padding: 20px;
-        }
-        body.dark {
+        }}
+        body.dark {{
             background: #0b1a26;
             color: #e2e8f0;
-        }
-        .container { max-width: 1400px; margin: 0 auto; }
-        .header {
+        }}
+        .container {{ max-width: 1400px; margin: 0 auto; }}
+        .header {{
             display: flex;
             justify-content: space-between;
             align-items: center;
             margin-bottom: 30px;
             flex-wrap: wrap;
             gap: 15px;
-        }
-        .logo { font-size: 28px; font-weight: 700; color: #1a6b8a; }
-        .logo span { color: #0b2e4f; }
-        .dark .logo { color: #60a5fa; }
-        .dark .logo span { color: #93c5fd; }
-        .status-badge {
+        }}
+        .logo {{ font-size: 28px; font-weight: 700; color: #1a6b8a; }}
+        .logo span {{ color: #0b2e4f; }}
+        .dark .logo {{ color: #60a5fa; }}
+        .dark .logo span {{ color: #93c5fd; }}
+        .status-badge {{
             background: #e6f7e6;
             color: #0e7c3e;
             padding: 6px 16px;
@@ -1097,52 +1158,52 @@ if app is not None:
             display: flex;
             align-items: center;
             gap: 6px;
-        }
-        .dark .status-badge { background: #1a3a2a; color: #6fcf97; }
-        .dot { width: 8px; height: 8px; background: #0e7c3e; border-radius: 50%; animation: pulse 2s infinite; }
-        .dark .dot { background: #6fcf97; }
-        @keyframes pulse { 0% { opacity: 1; } 50% { opacity: 0.3; } 100% { opacity: 1; } }
-        .last-updated { font-size: 13px; color: #718096; }
-        .dark .last-updated { color: #a0aec0; }
-        .metric-grid {
+        }}
+        .dark .status-badge {{ background: #1a3a2a; color: #6fcf97; }}
+        .dot {{ width: 8px; height: 8px; background: #0e7c3e; border-radius: 50%; animation: pulse 2s infinite; }}
+        .dark .dot {{ background: #6fcf97; }}
+        @keyframes pulse {{ 0% {{ opacity: 1; }} 50% {{ opacity: 0.3; }} 100% {{ opacity: 1; }} }}
+        .last-updated {{ font-size: 13px; color: #718096; }}
+        .dark .last-updated {{ color: #a0aec0; }}
+        .metric-grid {{
             display: grid;
             grid-template-columns: repeat(auto-fit, minmax(170px, 1fr));
             gap: 16px;
             margin-bottom: 30px;
-        }
-        .metric-card {
+        }}
+        .metric-card {{
             background: white;
             border-radius: 12px;
             padding: 16px;
             box-shadow: 0 2px 8px rgba(0,0,0,0.04);
             border: 1px solid #edf2f7;
             transition: 0.2s;
-        }
-        .dark .metric-card {
+        }}
+        .dark .metric-card {{
             background: #1a202c;
             border-color: #2d3748;
-        }
-        .metric-card:hover { transform: translateY(-2px); box-shadow: 0 4px 16px rgba(0,0,0,0.08); }
-        .metric-label {
+        }}
+        .metric-card:hover {{ transform: translateY(-2px); box-shadow: 0 4px 16px rgba(0,0,0,0.08); }}
+        .metric-label {{
             font-size: 11px;
             text-transform: uppercase;
             letter-spacing: 0.5px;
             color: #718096;
             margin-bottom: 4px;
-        }
-        .dark .metric-label { color: #a0aec0; }
-        .metric-value {
+        }}
+        .dark .metric-label {{ color: #a0aec0; }}
+        .metric-value {{
             font-size: 24px;
             font-weight: 700;
-        }
-        .metric-unit {
+        }}
+        .metric-unit {{
             font-size: 13px;
             font-weight: 400;
             color: #718096;
             margin-left: 4px;
-        }
-        .dark .metric-unit { color: #a0aec0; }
-        .recommendation {
+        }}
+        .dark .metric-unit {{ color: #a0aec0; }}
+        .recommendation {{
             background: #e0f2fe;
             border-left: 4px solid #1a6b8a;
             padding: 14px 20px;
@@ -1153,12 +1214,12 @@ if app is not None:
             align-items: center;
             flex-wrap: wrap;
             gap: 10px;
-        }
-        .dark .recommendation { background: #1a2a3a; border-color: #60a5fa; }
-        .rec-text { font-weight: 500; font-size: 15px; }
-        .rec-text strong { color: #1a6b8a; }
-        .dark .rec-text strong { color: #60a5fa; }
-        .tabs {
+        }}
+        .dark .recommendation {{ background: #1a2a3a; border-color: #60a5fa; }}
+        .rec-text {{ font-weight: 500; font-size: 15px; }}
+        .rec-text strong {{ color: #1a6b8a; }}
+        .dark .rec-text strong {{ color: #60a5fa; }}
+        .tabs {{
             display: flex;
             gap: 6px;
             background: #e2e8f0;
@@ -1166,9 +1227,9 @@ if app is not None:
             border-radius: 10px;
             margin-bottom: 25px;
             width: fit-content;
-        }
-        .dark .tabs { background: #2d3748; }
-        .tab {
+        }}
+        .dark .tabs {{ background: #2d3748; }}
+        .tab {{
             padding: 8px 20px;
             border: none;
             border-radius: 8px;
@@ -1178,17 +1239,17 @@ if app is not None:
             color: #4a5568;
             transition: 0.2s;
             font-size: 14px;
-        }
-        .dark .tab { color: #a0aec0; }
-        .tab.active {
+        }}
+        .dark .tab {{ color: #a0aec0; }}
+        .tab.active {{
             background: white;
             color: #1a202c;
             box-shadow: 0 2px 8px rgba(0,0,0,0.08);
-        }
-        .dark .tab.active { background: #1a202c; color: #e2e8f0; }
-        .tab-content { display: none; }
-        .tab-content.active { display: block; }
-        .chart-container {
+        }}
+        .dark .tab.active {{ background: #1a202c; color: #e2e8f0; }}
+        .tab-content {{ display: none; }}
+        .tab-content.active {{ display: block; }}
+        .chart-container {{
             background: white;
             border-radius: 12px;
             padding: 16px;
@@ -1196,12 +1257,12 @@ if app is not None:
             border: 1px solid #edf2f7;
             margin-bottom: 25px;
             height: 340px;
-        }
-        .dark .chart-container {
+        }}
+        .dark .chart-container {{
             background: #1a202c;
             border-color: #2d3748;
-        }
-        .table-wrap {
+        }}
+        .table-wrap {{
             background: white;
             border-radius: 12px;
             padding: 16px;
@@ -1209,14 +1270,14 @@ if app is not None:
             border: 1px solid #edf2f7;
             overflow-x: auto;
             margin-bottom: 25px;
-        }
-        .dark .table-wrap { background: #1a202c; border-color: #2d3748; }
-        table { width: 100%; border-collapse: collapse; font-size: 14px; }
-        th { text-align: left; padding: 8px 6px; color: #4a5568; font-weight: 600; border-bottom: 2px solid #edf2f7; }
-        .dark th { color: #a0aec0; border-bottom-color: #2d3748; }
-        td { padding: 6px; border-bottom: 1px solid #edf2f7; }
-        .dark td { border-bottom-color: #2d3748; }
-        .refresh-btn {
+        }}
+        .dark .table-wrap {{ background: #1a202c; border-color: #2d3748; }}
+        table {{ width: 100%; border-collapse: collapse; font-size: 14px; }}
+        th {{ text-align: left; padding: 8px 6px; color: #4a5568; font-weight: 600; border-bottom: 2px solid #edf2f7; }}
+        .dark th {{ color: #a0aec0; border-bottom-color: #2d3748; }}
+        td {{ padding: 6px; border-bottom: 1px solid #edf2f7; }}
+        .dark td {{ border-bottom-color: #2d3748; }}
+        .refresh-btn {{
             background: #1a6b8a;
             color: white;
             border: none;
@@ -1226,46 +1287,51 @@ if app is not None:
             cursor: pointer;
             transition: 0.2s;
             font-size: 13px;
-        }
-        .refresh-btn:hover { background: #0f4a62; }
-        .footer {
+        }}
+        .refresh-btn:hover {{ background: #0f4a62; }}
+        .footer {{
             margin-top: 40px;
             text-align: center;
             font-size: 12px;
             color: #718096;
-        }
-        .dark .footer { color: #a0aec0; }
-        .corridor-grid {
+        }}
+        .dark .footer {{ color: #a0aec0; }}
+        .corridor-grid {{
             display: grid;
             grid-template-columns: 1fr 1fr;
             gap: 16px;
             margin-bottom: 16px;
-        }
-        .corridor-chart {
+        }}
+        .corridor-chart {{
             background: white;
             border-radius: 12px;
             padding: 16px;
             box-shadow: 0 2px 8px rgba(0,0,0,0.04);
             border: 1px solid #edf2f7;
             height: 280px;
-        }
-        .dark .corridor-chart {
+        }}
+        .dark .corridor-chart {{
             background: #1a202c;
             border-color: #2d3748;
-        }
-        @media (max-width: 640px) {
-            .metric-grid { grid-template-columns: 1fr 1fr; }
-            .metric-value { font-size: 20px; }
-            .header { flex-direction: column; align-items: flex-start; }
-            .corridor-grid { grid-template-columns: 1fr; }
-        }
+        }}
+        @media (max-width: 640px) {{
+            .metric-grid {{ grid-template-columns: 1fr 1fr; }}
+            .metric-value {{ font-size: 20px; }}
+            .header {{ flex-direction: column; align-items: flex-start; }}
+            .corridor-grid {{ grid-template-columns: 1fr; }}
+        }}
     </style>
 </head>
 <body>
 <div class="container">
     <!-- Header -->
     <div class="header">
-        <div class="logo">Grid<span>Tweak</span></div>
+        <div>
+            <div class="logo">Grid<span>Tweak</span></div>
+            <div style="font-size: 14px; color: #718096; margin-top: 4px; font-weight: 500;">
+                📍 {location}
+            </div>
+        </div>
         <div style="display:flex;align-items:center;gap:12px;flex-wrap:wrap;">
             <span class="last-updated" id="lastUpdated">Updating...</span>
             <div class="status-badge"><span class="dot"></span> System Live</div>
@@ -1319,51 +1385,48 @@ if app is not None:
 </div>
 
 <script>
-    // ----- Chart instances -----
     let histChart, forecastChart, dlrBarChart, sagBarChart;
     const voltage = 220, pf = 0.9;
 
-    function initCharts() {
-        const opts = (title) => ({
+    function initCharts() {{
+        const opts = (title) => ({{
             responsive: true,
             maintainAspectRatio: false,
-            interaction: { mode: 'index', intersect: false },
-            plugins: {
-                legend: { position: 'top', labels: { font: { size: 12 } } },
-                tooltip: { backgroundColor: '#0b2e4f', titleFont: { weight: '600' } }
-            },
-            scales: {
-                y: { beginAtZero: true, grid: { color: '#edf2f7' }, title: { display: true, text: title, font: { size: 12 } } },
-                x: { grid: { display: false } }
-            }
-        });
-        histChart = new Chart(document.getElementById('historicalChart'), { type: 'line', data: { labels: [], datasets: [] }, options: opts('MW / °C') });
-        forecastChart = new Chart(document.getElementById('forecastChart'), { type: 'line', data: { labels: [], datasets: [] }, options: opts('MW / °C') });
-        dlrBarChart = new Chart(document.getElementById('corridorDlrChart'), { type: 'bar', data: { labels: [], datasets: [] }, options: {...opts('MW'), plugins: { legend: { display: false } }} });
-        sagBarChart = new Chart(document.getElementById('corridorSagChart'), { type: 'bar', data: { labels: [], datasets: [] }, options: {...opts('Sag (m)'), plugins: { legend: { display: false } }} });
-    }
+            interaction: {{ mode: 'index', intersect: false }},
+            plugins: {{
+                legend: {{ position: 'top', labels: {{ font: {{ size: 12 }} }} }},
+                tooltip: {{ backgroundColor: '#0b2e4f', titleFont: {{ weight: '600' }} }}
+            }},
+            scales: {{
+                y: {{ beginAtZero: true, grid: {{ color: '#edf2f7' }}, title: {{ display: true, text: title, font: {{ size: 12 }} }} }},
+                x: {{ grid: {{ display: false }} }}
+            }}
+        }});
+        histChart = new Chart(document.getElementById('historicalChart'), {{ type: 'line', data: {{ labels: [], datasets: [] }}, options: opts('MW / °C') }});
+        forecastChart = new Chart(document.getElementById('forecastChart'), {{ type: 'line', data: {{ labels: [], datasets: [] }}, options: opts('MW / °C') }});
+        dlrBarChart = new Chart(document.getElementById('corridorDlrChart'), {{ type: 'bar', data: {{ labels: [], datasets: [] }}, options: {{...opts('MW'), plugins: {{ legend: {{ display: false }} }} }} }});
+        sagBarChart = new Chart(document.getElementById('corridorSagChart'), {{ type: 'bar', data: {{ labels: [], datasets: [] }}, options: {{...opts('Sag (m)'), plugins: {{ legend: {{ display: false }} }} }} }});
+    }}
 
-    function ampsToMW(a) { return a * voltage * Math.sqrt(3) * pf / 1000; }
+    function ampsToMW(a) {{ return a * voltage * Math.sqrt(3) * pf / 1000; }}
 
-    // ----- Fetch & Update -----
-    async function fetchAll() {
+    async function fetchAll() {{
         await fetchHistorical();
         await fetchForecast();
         await fetchCorridor();
         document.getElementById('lastUpdated').textContent = 'Updated: ' + new Date().toLocaleTimeString();
-    }
+    }}
 
-    async function fetchHistorical() {
-        try {
+    async function fetchHistorical() {{
+        try {{
             const resp = await fetch('/dlr/current');
             if (!resp.ok) throw new Error('No data');
             const data = await resp.json();
-            // Use computed static rating from backend
             const staticMW = data.static_rating_mw || 350;
-            if (!data || !data.results || data.results.length === 0) {
+            if (!data || !data.results || data.results.length === 0) {{
                 showNoData();
                 return;
-            }
+            }}
             const results = data.results;
             const latest = results[results.length-1] || results[0];
             const dlrMW = latest.dlr_mw || ampsToMW(latest.dlr_a);
@@ -1376,41 +1439,39 @@ if app is not None:
             document.getElementById('ambient').innerHTML = (latest.ambient_c || 0).toFixed(1) + ' <span class="metric-unit">°C</span>';
             document.getElementById('wind').innerHTML = (latest.wind_mps || 0).toFixed(1) + ' <span class="metric-unit">m/s</span>';
             document.getElementById('sag').innerHTML = (latest.sag_m || 0).toFixed(2) + ' <span class="metric-unit">m</span>';
-            // Recommendation
             document.getElementById('recMw').textContent = headroom.toFixed(0);
             document.getElementById('recStatus').textContent = headroom > 0 ? '✅ Within limits' : '⚠️ Approaching thermal limit';
 
-            // Chart
             const timestamps = results.map(r => r.timestamp.slice(11,16));
             const dlrs = results.map(r => r.dlr_mw || ampsToMW(r.dlr_a));
             const temps = results.map(r => r.temperature_c || 0);
-            histChart.data = {
+            histChart.data = {{
                 labels: timestamps,
                 datasets: [
-                    { label: 'Available Capacity (MW)', data: dlrs, borderColor: '#1a6b8a', fill: true, backgroundColor: 'rgba(26,107,138,0.1)' },
-                    { label: 'Temperature (°C)', data: temps, borderColor: '#e53e3e', fill: true, backgroundColor: 'rgba(229,62,62,0.1)', yAxisID: 'y1' }
+                    {{ label: 'Available Capacity (MW)', data: dlrs, borderColor: '#1a6b8a', fill: true, backgroundColor: 'rgba(26,107,138,0.1)' }},
+                    {{ label: 'Temperature (°C)', data: temps, borderColor: '#e53e3e', fill: true, backgroundColor: 'rgba(229,62,62,0.1)', yAxisID: 'y1' }}
                 ]
-            };
+            }};
             histChart.update();
-        } catch(e) {
+        }} catch(e) {{
             console.error('Historical error:', e);
             showNoData();
-        }
-    }
+        }}
+    }}
 
-    function showNoData() {
+    function showNoData() {{
         const vals = ['dlr','headroom','utilization','temp','ambient','wind','sag'];
-        vals.forEach(id => {
+        vals.forEach(id => {{
             document.getElementById(id).innerHTML = '--';
-        });
+        }});
         document.getElementById('recMw').textContent = '--';
         document.getElementById('recStatus').textContent = '⏳ No data yet';
-        histChart.data = { labels: [], datasets: [] };
+        histChart.data = {{ labels: [], datasets: [] }};
         histChart.update();
-    }
+    }}
 
-    async function fetchForecast() {
-        try {
+    async function fetchForecast() {{
+        try {{
             const resp = await fetch('/dlr/forecast?days=7');
             if (!resp.ok) throw new Error('No forecast');
             const data = await resp.json();
@@ -1419,38 +1480,37 @@ if app is not None:
             const timestamps = results.map(r => r.timestamp.slice(11,16));
             const dlrs = results.map(r => r.dlr_mw);
             const temps = results.map(r => r.temperature_c);
-            forecastChart.data = {
+            forecastChart.data = {{
                 labels: timestamps,
                 datasets: [
-                    { label: 'Forecast Capacity (MW)', data: dlrs, borderColor: '#38a169', fill: true, backgroundColor: 'rgba(56,161,105,0.1)' },
-                    { label: 'Forecast Temperature (°C)', data: temps, borderColor: '#ed8936', fill: true, backgroundColor: 'rgba(237,137,54,0.1)', yAxisID: 'y1' }
+                    {{ label: 'Forecast Capacity (MW)', data: dlrs, borderColor: '#38a169', fill: true, backgroundColor: 'rgba(56,161,105,0.1)' }},
+                    {{ label: 'Forecast Temperature (°C)', data: temps, borderColor: '#ed8936', fill: true, backgroundColor: 'rgba(237,137,54,0.1)', yAxisID: 'y1' }}
                 ]
-            };
+            }};
             forecastChart.update();
-            // Table
             let tableHtml = `<table><tr><th>Date</th><th>00:00</th><th>06:00</th><th>12:00</th><th>18:00</th></tr>`;
-            const days = {};
-            results.forEach(r => {
+            const days = {{}};
+            results.forEach(r => {{
                 const date = r.timestamp.slice(0,10);
-                if (!days[date]) days[date] = {};
+                if (!days[date]) days[date] = {{}};
                 const hour = parseInt(r.timestamp.slice(11,13));
                 if ([0,6,12,18].includes(hour)) days[date][hour] = r.dlr_mw;
-            });
-            for (const [date, hours] of Object.entries(days)) {
-                tableHtml += `<tr><td>${date}</td>`;
-                for (const h of [0,6,12,18]) {
+            }});
+            for (const [date, hours] of Object.entries(days)) {{
+                tableHtml += `<tr><td>${{date}}</td>`;
+                for (const h of [0,6,12,18]) {{
                     const val = hours[h] !== undefined ? hours[h].toFixed(0) : '--';
-                    tableHtml += `<td>${val}</td>`;
-                }
+                    tableHtml += `<td>${{val}}</td>`;
+                }}
                 tableHtml += `</tr>`;
-            }
+            }}
             tableHtml += `</table>`;
             document.getElementById('forecastTable').innerHTML = tableHtml;
-        } catch(e) { console.error('Forecast error:', e); }
-    }
+        }} catch(e) {{ console.error('Forecast error:', e); }}
+    }}
 
-    async function fetchCorridor() {
-        try {
+    async function fetchCorridor() {{
+        try {{
             const resp = await fetch('/dlr/corridor');
             if (!resp.ok) throw new Error('No corridor data');
             const data = await resp.json();
@@ -1459,30 +1519,29 @@ if app is not None:
             const labels = segs.map((_, i) => 'Seg ' + (i+1));
             const dlrs = segs.map(s => s.min_dlr_mw);
             const sags = segs.map(s => s.sag_m);
-            dlrBarChart.data = { labels, datasets: [{ label: 'DLR (MW)', data: dlrs, backgroundColor: 'rgba(26,107,138,0.6)', borderColor: '#1a6b8a', borderWidth: 1 }] };
+            dlrBarChart.data = {{ labels, datasets: [{{ label: 'DLR (MW)', data: dlrs, backgroundColor: 'rgba(26,107,138,0.6)', borderColor: '#1a6b8a', borderWidth: 1 }}] }};
             dlrBarChart.update();
-            sagBarChart.data = { labels, datasets: [{ label: 'Sag (m)', data: sags, backgroundColor: 'rgba(229,62,62,0.6)', borderColor: '#e53e3e', borderWidth: 1 }] };
+            sagBarChart.data = {{ labels, datasets: [{{ label: 'Sag (m)', data: sags, backgroundColor: 'rgba(229,62,62,0.6)', borderColor: '#e53e3e', borderWidth: 1 }}] }};
             sagBarChart.update();
             let tableHtml = `<table><tr><th>Segment</th><th>DLR (MW)</th><th>Temp (°C)</th><th>Sag (m)</th></tr>`;
-            segs.forEach((s, i) => {
-                tableHtml += `<tr><td>${i+1}</td><td>${s.min_dlr_mw.toFixed(0)}</td><td>${s.temperature_c.toFixed(1)}</td><td>${s.sag_m.toFixed(2)}</td></tr>`;
-            });
+            segs.forEach((s, i) => {{
+                tableHtml += `<tr><td>${{i+1}}</td><td>${{s.min_dlr_mw.toFixed(0)}}</td><td>${{s.temperature_c.toFixed(1)}}</td><td>${{s.sag_m.toFixed(2)}}</td></tr>`;
+            }});
             tableHtml += `</table>`;
             document.getElementById('corridorTable').innerHTML = tableHtml;
-        } catch(e) { console.error('Corridor error:', e); }
-    }
+        }} catch(e) {{ console.error('Corridor error:', e); }}
+    }}
 
-    // Tab switching
-    document.querySelectorAll('.tab').forEach(tab => {
-        tab.addEventListener('click', function() {
+    document.querySelectorAll('.tab').forEach(tab => {{
+        tab.addEventListener('click', function() {{
             document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
             this.classList.add('active');
             document.querySelectorAll('.tab-content').forEach(c => c.classList.remove('active'));
             document.getElementById(this.dataset.tab + '-tab').classList.add('active');
             if (this.dataset.tab === 'forecast') fetchForecast();
             if (this.dataset.tab === 'corridor') fetchCorridor();
-        });
-    });
+        }});
+    }});
 
     initCharts();
     fetchAll();
@@ -1490,7 +1549,7 @@ if app is not None:
 </script>
 </body>
 </html>
-        """
+"""
         return html
 
 # ============================================================================
@@ -1505,7 +1564,6 @@ def main():
     parser.add_argument("--api", action="store_true", help="Start FastAPI server")
     parser.add_argument("--init-db", action="store_true", help="Initialize database")
     parser.add_argument("--port", type=int, default=8000, help="Port for API server")
-    # Corridor flags
     parser.add_argument("--corridor", action="store_true", help="Enable corridor modelling")
     parser.add_argument("--end-lat", type=float, help="End latitude for corridor")
     parser.add_argument("--end-lon", type=float, help="End longitude for corridor")
@@ -1513,7 +1571,6 @@ def main():
     parser.add_argument("--forecast", action="store_true", help="Use forecast weather instead of archive")
     args = parser.parse_args()
 
-    # Load config and update global defaults
     config = CONFIG_DEFAULTS.copy()
     if args.config:
         try:
@@ -1523,11 +1580,13 @@ def main():
                 CONFIG_DEFAULTS.update(config)
                 print(f"✅ Loaded config from {args.config}")
                 print(f"   static_rating_mw = {CONFIG_DEFAULTS.get('static_rating_mw')}")
+                print(f"   location_name = {CONFIG_DEFAULTS.get('location_name')}")
+                print(f"   wind_correction_factor = {CONFIG_DEFAULTS.get('wind_correction_factor')}")
+                print(f"   dlr_scaling_factor = {CONFIG_DEFAULTS.get('dlr_scaling_factor')}")
         except Exception as e:
             print(f"⚠️ Error loading config: {e}. Using defaults.")
     else:
         print("ℹ️ No config file provided. Using default values.")
-        print(f"   static_rating_mw (override) = {CONFIG_DEFAULTS.get('static_rating_mw')}")
 
     db_path = CONFIG_DEFAULTS["database_path"]
 
@@ -1575,7 +1634,6 @@ def main():
             print(f"Weakest segment sag: {weak_seg['sag_at_min_dlr']:.2f} m at {weak_seg['temperature_at_min_dlr']:.1f} °C")
             return 0
 
-        # ---- Single point ----
         run_scheduled_job(CONFIG_DEFAULTS, db_path, ml_model, ml_scaler)
         return 0
 
