@@ -12,6 +12,7 @@ Wind Speed Clamp + Weighted Smoothing + Correction Factor applied.
 DLR Scaling Factor for safety margin.
 Location name displayed on dashboard.
 Favicon loaded from favicon_base64.txt (if present).
+Forecast: reduced days, User‑Agent, exponential backoff.
 """
 
 import argparse
@@ -112,7 +113,7 @@ CONFIG_DEFAULTS = {
     # --- WIND CORRECTION SETTINGS ---
     "wind_max_mps": 7.0,
     "wind_smoothing_window": 3,
-    "wind_correction_factor": 0.35,
+    "wind_correction_factor": 0.4,
     # --- DLR CALIBRATION SETTINGS ---
     "dlr_scaling_factor": 0.80
 }
@@ -410,37 +411,45 @@ def apply_wind_correction(records: List[WeatherRecord], config: Dict) -> List[We
     return records
 
 def fetch_weather_from_openmeteo(lat, lon, start_date, end_date, timezone="auto", forecast=False):
+    # Use a simpler, more reliable request with User-Agent and fewer forecast days
     if forecast:
         base_url = "https://api.open-meteo.com/v1/forecast"
         params = {"latitude": lat, "longitude": lon,
                   "hourly": "temperature_2m,wind_speed_10m,wind_direction_10m,shortwave_radiation",
-                  "timezone": timezone, "forecast_days": 16}
+                  "timezone": timezone, "forecast_days": 7}
     else:
         base_url = "https://archive-api.open-meteo.com/v1/archive"
         params = {"latitude": lat, "longitude": lon,
                   "start_date": start_date, "end_date": end_date,
                   "hourly": "temperature_2m,wind_speed_10m,wind_direction_10m,shortwave_radiation",
                   "timezone": timezone}
+    
     url = base_url + "?" + urllib.parse.urlencode(params)
     print(f"Fetching weather from: {url}")
-    max_retries = 3
-    delay = 2
+    
+    headers = {'User-Agent': 'GridTweak/1.0 (DLR Platform; contact: hello@gridtweak.com)'}
+    
+    max_retries = 5
+    base_delay = 3
     for attempt in range(max_retries):
         try:
-            with urllib.request.urlopen(url, timeout=120) as response:
+            req = urllib.request.Request(url, headers=headers)
+            with urllib.request.urlopen(req, timeout=30) as response:
                 data = json.loads(response.read().decode())
             break
         except Exception as e:
             if attempt < max_retries - 1:
+                delay = base_delay * (attempt + 1)
                 print(f"Attempt {attempt+1} failed: {e}. Retrying in {delay} seconds...")
                 time.sleep(delay)
-                delay *= 2
             else:
                 raise RuntimeError(f"Failed to fetch weather after {max_retries} attempts: {e}")
+    
     hourly = data.get("hourly", {})
     times = hourly.get("time", [])
     if not times:
         raise RuntimeError("No times returned from API")
+    
     records = []
     for i, ts in enumerate(times):
         try:
@@ -450,22 +459,32 @@ def fetch_weather_from_openmeteo(lat, lon, start_date, end_date, timezone="auto"
             wind = hourly["wind_speed_10m"][i]
             wdir = hourly["wind_direction_10m"][i]
             ghi = hourly["shortwave_radiation"][i]
+            
             def sanitise(val, default=0.0):
                 if val is None or not isinstance(val, (int, float)):
                     return default
                 return float(val)
+            
             amb = sanitise(amb, 15.0)
             wind = sanitise(wind, 0.0)
             wdir = sanitise(wdir, 0.0)
             ghi = sanitise(ghi, 0.0)
+            
             if wind == 0.0:
                 wdir = 0.0
             if wdir < 0 or wdir >= 360:
                 wdir = 0.0
-            records.append(WeatherRecord(timestamp=ts, ambient_c=amb, wind_mps=wind,
-                                         wind_direction_deg=wdir, ghi_w_m2=ghi))
+            
+            records.append(WeatherRecord(
+                timestamp=ts, 
+                ambient_c=amb, 
+                wind_mps=wind,
+                wind_direction_deg=wdir, 
+                ghi_w_m2=ghi
+            ))
         except (KeyError, IndexError, ValueError) as e:
             print(f"Warning: skipping record at index {i} due to {e}")
+    
     if forecast and start_date and end_date:
         try:
             start_dt = datetime.fromisoformat(start_date)
@@ -481,7 +500,8 @@ def fetch_weather_from_openmeteo(lat, lon, start_date, end_date, timezone="auto"
             records = filtered
         except Exception as e:
             print(f"Warning: date filtering failed: {e}")
-
+    
+    # Apply wind correction
     records = apply_wind_correction(records, CONFIG_DEFAULTS)
     return records
 
@@ -964,7 +984,7 @@ if app is not None:
         return JSONResponse(content=runs)
 
     @app.get("/dlr/forecast")
-    async def get_forecast(days: int = Query(7, ge=1, le=16)):
+    async def get_forecast(days: int = Query(7, ge=1, le=7)):  # force days 1-7
         lat = CONFIG_DEFAULTS["lat"]
         lon = CONFIG_DEFAULTS["lon"]
         conductor = get_conductor(CONFIG_DEFAULTS["conductor"])
@@ -973,7 +993,13 @@ if app is not None:
         try:
             weather = fetch_weather_from_openmeteo(lat, lon, start_date, end_date, forecast=True)
         except Exception as e:
-            raise HTTPException(status_code=500, detail=str(e))
+            print(f"❌ Forecast fetch failed: {e}")
+            raise HTTPException(status_code=500, detail=f"Forecast service unavailable: {str(e)}")
+        
+        # If no forecast data, return empty array gracefully
+        if not weather:
+            return JSONResponse(content={"forecast": []})
+            
         results = []
         for w in weather:
             try:
@@ -1493,9 +1519,18 @@ if app is not None:
     async function fetchForecast() {{
         try {{
             const resp = await fetch('/dlr/forecast?days=7');
-            if (!resp.ok) throw new Error('No forecast');
+            if (!resp.ok) {{
+                const errText = await resp.text();
+                console.error('Forecast API error:', resp.status, errText);
+                document.getElementById('forecastTable').innerHTML = `<p style="color:red;">⚠️ Forecast unavailable (${resp.status})</p>`;
+                return;
+            }}
             const data = await resp.json();
-            if (!data || !data.forecast || data.forecast.length === 0) return;
+            console.log('✅ Forecast data:', data);
+            if (!data || !data.forecast || data.forecast.length === 0) {{
+                document.getElementById('forecastTable').innerHTML = '<p>No forecast data available for this location.</p>';
+                return;
+            }}
             const results = data.forecast;
             const timestamps = results.map(r => r.timestamp.slice(11,16));
             const dlrs = results.map(r => r.dlr_mw);
@@ -1526,7 +1561,10 @@ if app is not None:
             }}
             tableHtml += `</table>`;
             document.getElementById('forecastTable').innerHTML = tableHtml;
-        }} catch(e) {{ console.error('Forecast error:', e); }}
+        }} catch(e) {{
+            console.error('Forecast fetch error:', e);
+            document.getElementById('forecastTable').innerHTML = `<p style="color:red;">⚠️ Failed to load forecast: ${{e.message}}</p>`;
+        }}
     }}
 
     async function fetchCorridor() {{
@@ -1549,7 +1587,9 @@ if app is not None:
             }});
             tableHtml += `</table>`;
             document.getElementById('corridorTable').innerHTML = tableHtml;
-        }} catch(e) {{ console.error('Corridor error:', e); }}
+        }} catch(e) {{
+            console.error('Corridor error:', e);
+        }}
     }}
 
     document.querySelectorAll('.tab').forEach(tab => {{
