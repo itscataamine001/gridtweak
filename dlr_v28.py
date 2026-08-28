@@ -12,7 +12,7 @@ Wind Speed Clamp + Weighted Smoothing + Correction Factor applied.
 DLR Scaling Factor for safety margin.
 Location name displayed on dashboard.
 Favicon loaded from favicon_base64.txt (if present).
-Forecast: file‑based caching (persistent across restarts) – Open‑Meteo only called every 6 hours.
+Forecast: file‑based caching with archive fallback – no on‑request fetching.
 """
 
 import argparse
@@ -570,10 +570,10 @@ def fetch_weather_multi_year(lat, lon, start_date, end_date):
 # ============================================================================
 
 def update_forecast_cache():
-    """Fetch forecast from Open-Meteo and store in memory + disk. Only fetches if cache is stale."""
+    """Fetch forecast from Open-Meteo. If that fails, use archive data (last 7 days)."""
     global _cached_forecast
-    
-    # Check if cache is fresh (less than 6 hours old)
+
+    # Check if cache is fresh (< 6 hours old)
     if _cached_forecast["last_updated"]:
         try:
             last_updated = datetime.fromisoformat(_cached_forecast["last_updated"])
@@ -582,25 +582,44 @@ def update_forecast_cache():
                 print(f"⏭️ Forecast cache is fresh ({age:.1f} hours old). Skipping fetch.")
                 return
         except:
-            pass  # If parsing fails, proceed to fetch
-    
+            pass
+
     try:
-        print("🌤️ Updating forecast cache from Open-Meteo...")
+        print("🌤️ Updating forecast cache...")
         lat = CONFIG_DEFAULTS["lat"]
         lon = CONFIG_DEFAULTS["lon"]
         conductor = get_conductor(CONFIG_DEFAULTS["conductor"])
         days = 7
         start_date = datetime.now().strftime("%Y-%m-%d")
         end_date = (datetime.now() + timedelta(days=days)).strftime("%Y-%m-%d")
-        
-        weather = fetch_weather_from_openmeteo(lat, lon, start_date, end_date, forecast=True)
+        weather = None
+        data_source = ""
+
+        # ---- Try forecast first ----
+        try:
+            weather = fetch_weather_from_openmeteo(lat, lon, start_date, end_date, forecast=True)
+            if weather:
+                data_source = "Open-Meteo forecast"
+                print(f"✅ Forecast fetched ({len(weather)} records)")
+        except Exception as e:
+            print(f"⚠️ Forecast failed ({e}), trying archive...")
+
+        # ---- Fallback: use archive data (last 7 days) ----
         if not weather:
-            print("⚠️ Open-Meteo returned no data. Keeping old cache.")
+            try:
+                archive_start = (datetime.now() - timedelta(days=days)).strftime("%Y-%m-%d")
+                weather = fetch_weather_from_openmeteo(lat, lon, archive_start, end_date, forecast=False)
+                if weather:
+                    data_source = "Archive (fallback)"
+                    print(f"✅ Archive fallback fetched ({len(weather)} records)")
+            except Exception as e:
+                print(f"❌ Archive fallback also failed: {e}")
+
+        if not weather:
+            print("❌ All weather sources failed. Cache not updated.")
             return
-        
-        print(f"✅ Open-Meteo forecast fetched ({len(weather)} records)")
-        
-        # Process weather into DLR results
+
+        # ---- Process weather into DLR results ----
         results = []
         for w in weather:
             try:
@@ -612,13 +631,13 @@ def update_forecast_cache():
             geo = wind_geometry(w.wind_mps, w.wind_direction_deg, LINE_AZIMUTH_DEG)
             wind_perp = geo["perpendicular_ms"]
             attack_deg = geo["attack_angle_deg"]
-            
+
             dlr = solve_dlr(w.ambient_c, wind_perp, w.ghi_w_m2, sp["altitude_deg"], sp["azimuth_deg"],
                             conductor, LINE_AZIMUTH_DEG, attack_deg,
                             CONFIG_DEFAULTS["convection_model"], ROUGHNESS_M, TURB_INTENSITY)
             scaling = CONFIG_DEFAULTS.get("dlr_scaling_factor", 1.0)
             dlr = dlr * scaling
-            
+
             temp_res = solve_temperature(CONFIG_DEFAULTS["test_current"], w.ambient_c, wind_perp, w.ghi_w_m2,
                                          sp["altitude_deg"], sp["azimuth_deg"],
                                          conductor, LINE_AZIMUTH_DEG, attack_deg,
@@ -644,15 +663,13 @@ def update_forecast_cache():
                 "sag_m": sag_m,
                 "status": "OK" if temp_res["temperature_c"] <= conductor.tmax_c else "OVER"
             })
-        
-        # Update memory cache
+
+        # ---- Save to cache and disk ----
         _cached_forecast["data"] = results
         _cached_forecast["last_updated"] = datetime.now().isoformat()
-        
-        # Save to disk
         save_forecast_cache_to_file()
-        
-        print(f"✅ Forecast cache updated: {len(results)} records at {_cached_forecast['last_updated']}")
+        print(f"✅ Forecast cache updated ({data_source}): {len(results)} records at {_cached_forecast['last_updated']}")
+
     except Exception as e:
         print(f"❌ Forecast cache update failed: {e}. Keeping old cache.")
 
@@ -1115,20 +1132,10 @@ if app is not None:
 
     @app.get("/dlr/forecast")
     async def get_forecast():
-        """Return cached forecast data instantly."""
+        """Return cached forecast data. No live fetching here."""
         global _cached_forecast
         if _cached_forecast["data"] is None:
-            # Try to update cache on first request (fallback)
-            print("⚠️ Forecast cache empty, attempting to fetch...")
-            try:
-                update_forecast_cache()
-            except Exception as e:
-                print(f"❌ Fallback forecast fetch failed: {e}")
-                return JSONResponse(content={"forecast": []})
-        
-        if _cached_forecast["data"] is None:
             return JSONResponse(content={"forecast": []})
-        
         return JSONResponse(content={"forecast": _cached_forecast["data"]})
 
     @app.get("/dlr/corridor")
