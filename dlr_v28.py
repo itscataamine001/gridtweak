@@ -866,9 +866,11 @@ def enrich_with_mw(results, voltage_kv, pf):
     return results
 
 if app is not None:
+    from fastapi.responses import RedirectResponse
+
     @app.get("/")
     async def root():
-        return {"message": f"{APP_NAME} DLR API", "version": VERSION, "status": "running"}
+        return RedirectResponse(url="/dashboard")
 
     @app.get("/dlr/current")
     async def get_current():
