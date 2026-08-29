@@ -164,6 +164,8 @@ CONFIG_DEFAULTS = {
     "sag_ref_m": 5.0,
     "thermal_expansion_coeff": 23e-6,
     "ref_temp_sag": 20.0,
+    # --- TIMEZONE OFFSET (UTC+5.5 for India) ---
+    "timezone_offset_hours": 5.5,
     # --- WIND CORRECTION SETTINGS (EXPERIMENTAL) ---
     "wind_max_mps": 7.0,
     "wind_smoothing_window": 3,
@@ -375,9 +377,10 @@ SOLAR_AZIMUTH = [
     277.54, 282.19, 287.59, 294.46, 304.05, 318.51
 ]
 
-def solar_position(hour):
-    if not 0 <= hour < 24:
-        raise ValueError(f"Invalid hour: {hour}")
+def solar_position(local_hour):
+    """Return solar altitude and azimuth for the given local hour (0-23)."""
+    # Ensure hour is an integer in 0-23 range
+    hour = int(round(local_hour)) % 24
     return {"altitude_deg": SOLAR_ALTITUDE[hour], "azimuth_deg": SOLAR_AZIMUTH[hour]}
 
 # ============================================================================
@@ -523,9 +526,10 @@ def fetch_weather_from_openmeteo(lat, lon, start_date, end_date, timezone="auto"
             wdir = hourly["wind_direction_10m"][i]
             ghi = hourly["shortwave_radiation"][i]
             
-            def sanitise(val, default=0.0):
+            def sanitise(val, default=None):
                 if val is None or not isinstance(val, (int, float)):
-                    return default
+                    print(f"⚠️ Missing data at {ts}, using default {default}")
+                    return default if default is not None else 0.0
                 return float(val)
             
             amb = sanitise(amb, 15.0)
@@ -630,7 +634,8 @@ def update_forecast_cache():
         # ---- Fallback: use archive data (last 7 days) ----
         if not weather:
             try:
-                archive_start = (datetime.now() - timedelta(days=days)).strftime("%Y-%m-%d")
+                archive_days = 7
+                archive_start = (datetime.now() - timedelta(days=archive_days)).strftime("%Y-%m-%d")
                 weather = fetch_weather_from_openmeteo(lat, lon, archive_start, end_date, forecast=False)
                 if weather:
                     data_source = "Archive (fallback)"
@@ -647,45 +652,48 @@ def update_forecast_cache():
         for w in weather:
             try:
                 dt = datetime.fromisoformat(w.timestamp)
-                hour = dt.hour
-            except:
-                hour = 12
-            sp = solar_position(hour)
-            geo = wind_geometry(w.wind_mps, w.wind_direction_deg, LINE_AZIMUTH_DEG)
-            wind_perp = geo["perpendicular_ms"]
-            attack_deg = geo["attack_angle_deg"]
+                offset = CONFIG_DEFAULTS.get("timezone_offset_hours", 0)
+                # ✅ FIX: Convert to integer and ensure 0-23 range
+                local_hour = int(round((dt.hour + offset) % 24)) % 24
+                sp = solar_position(local_hour)
+                geo = wind_geometry(w.wind_mps, w.wind_direction_deg, LINE_AZIMUTH_DEG)
+                wind_perp = geo["perpendicular_ms"]
+                attack_deg = geo["attack_angle_deg"]
 
-            dlr = solve_dlr(w.ambient_c, wind_perp, w.ghi_w_m2, sp["altitude_deg"], sp["azimuth_deg"],
-                            conductor, LINE_AZIMUTH_DEG, attack_deg,
-                            CONFIG_DEFAULTS["convection_model"], ROUGHNESS_M, TURB_INTENSITY)
-            scaling = CONFIG_DEFAULTS.get("conservative_derating_factor", 1.0)
-            dlr = dlr * scaling
+                dlr = solve_dlr(w.ambient_c, wind_perp, w.ghi_w_m2, sp["altitude_deg"], sp["azimuth_deg"],
+                                conductor, LINE_AZIMUTH_DEG, attack_deg,
+                                CONFIG_DEFAULTS["convection_model"], ROUGHNESS_M, TURB_INTENSITY)
+                scaling = CONFIG_DEFAULTS.get("conservative_derating_factor", 1.0)
+                dlr = dlr * scaling
 
-            temp_res = solve_temperature(CONFIG_DEFAULTS["test_current"], w.ambient_c, wind_perp, w.ghi_w_m2,
-                                         sp["altitude_deg"], sp["azimuth_deg"],
-                                         conductor, LINE_AZIMUTH_DEG, attack_deg,
-                                         CONFIG_DEFAULTS["convection_model"], ROUGHNESS_M, TURB_INTENSITY)
-            voltage = CONFIG_DEFAULTS.get("nominal_voltage_kv", 220)
-            pf = CONFIG_DEFAULTS.get("power_factor", 0.9)
-            mw = amps_to_mw(dlr, voltage, pf)
-            sag_m = calculate_sag(
-                temp_res["temperature_c"],
-                conductor,
-                CONFIG_DEFAULTS.get("span_length_m", 400),
-                ref_temp=CONFIG_DEFAULTS.get("ref_temp_sag", 20.0),
-                sag_ref=CONFIG_DEFAULTS.get("sag_ref_m", 5.0)
-            )
-            results.append({
-                "timestamp": w.timestamp,
-                "dlr_a": dlr,
-                "dlr_mw": mw,
-                "temperature_c": temp_res["temperature_c"],
-                "ambient_c": w.ambient_c,
-                "wind_mps": w.wind_mps,
-                "ghi_w_m2": w.ghi_w_m2,
-                "sag_m": sag_m,
-                "status": "OK" if temp_res["temperature_c"] <= conductor.tmax_c else "OVER"
-            })
+                temp_res = solve_temperature(CONFIG_DEFAULTS["test_current"], w.ambient_c, wind_perp, w.ghi_w_m2,
+                                             sp["altitude_deg"], sp["azimuth_deg"],
+                                             conductor, LINE_AZIMUTH_DEG, attack_deg,
+                                             CONFIG_DEFAULTS["convection_model"], ROUGHNESS_M, TURB_INTENSITY)
+                voltage = CONFIG_DEFAULTS.get("nominal_voltage_kv", 220)
+                pf = CONFIG_DEFAULTS.get("power_factor", 0.9)
+                mw = amps_to_mw(dlr, voltage, pf)
+                sag_m = calculate_sag(
+                    temp_res["temperature_c"],
+                    conductor,
+                    CONFIG_DEFAULTS.get("span_length_m", 400),
+                    ref_temp=CONFIG_DEFAULTS.get("ref_temp_sag", 20.0),
+                    sag_ref=CONFIG_DEFAULTS.get("sag_ref_m", 5.0)
+                )
+                results.append({
+                    "timestamp": w.timestamp,
+                    "dlr_a": dlr,
+                    "dlr_mw": mw,
+                    "temperature_c": temp_res["temperature_c"],
+                    "ambient_c": w.ambient_c,
+                    "wind_mps": w.wind_mps,
+                    "ghi_w_m2": w.ghi_w_m2,
+                    "sag_m": sag_m,
+                    "status": "OK" if temp_res["temperature_c"] <= conductor.tmax_c else "OVER"
+                })
+            except Exception as e:
+                print(f"⚠️ Skipping record {w.timestamp} due to {e}")
+                continue
 
         # ---- Save to cache and disk ----
         _cached_forecast["data"] = results
@@ -761,10 +769,11 @@ def run_dlr_for_period_segment(weather_records, conductor, convection_model,
     for i, w in enumerate(weather_records):
         try:
             dt = datetime.fromisoformat(w.timestamp)
-            hour = dt.hour
+            offset = CONFIG_DEFAULTS.get("timezone_offset_hours", 0)
+            local_hour = int(round((dt.hour + offset) % 24)) % 24
         except:
-            hour = 12
-        sp = solar_position(hour)
+            local_hour = 12
+        sp = solar_position(local_hour)
         geo = wind_geometry(w.wind_mps, w.wind_direction_deg, LINE_AZIMUTH_DEG)
         wind_perp = geo["perpendicular_ms"]
         attack_deg = geo["attack_angle_deg"]
