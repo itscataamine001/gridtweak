@@ -1,7 +1,7 @@
 {
   "lat": 19.076,
   "lon": 72.877,
-  "location_name": "MSETCL 220kV Trombay-Vikhroli",
+  "location_name": "MSETCL – 220kV Trombay-Vikhroli",
   "conductor": "panther",
   "convection_model": "ieee738",
   "test_current": 1000,
@@ -19,6 +19,6 @@
   "slack_enabled": false,
   "wind_max_mps": 7.0,
   "wind_smoothing_window": 3,
-  "wind_correction_factor": 0.40,
-  "dlr_scaling_factor": 0.80
+  "wind_correction_factor": 0.4,
+  "conservative_derating_factor": 0.80
 }

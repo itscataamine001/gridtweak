@@ -9,10 +9,19 @@ Root URL redirects to /dashboard.
 Historical data is limited to 24 hours.
 Zebra/Panther conductors added.
 Wind Speed Clamp + Weighted Smoothing + Correction Factor applied.
-DLR Scaling Factor for safety margin.
+Conservative Derating Factor (0.80) applied for safety margin.
 Location name displayed on dashboard.
 Favicon loaded from favicon_base64.txt (if present).
 Forecast: file‑based caching with archive fallback – no on‑request fetching.
+
+Dashboard displays:
+- Thermal Rating (Amps)
+- Conservative Rating (Amps, DLR × 0.80)
+- Thermal Capacity Factor
+- Footnote: Thermal headroom only; transfer limits may apply.
+
+Methodology Note: Wind correction is experimental and calibrated for Mumbai.
+Pending site‑specific validation.
 """
 
 import argparse
@@ -151,12 +160,12 @@ CONFIG_DEFAULTS = {
     "sag_ref_m": 5.0,
     "thermal_expansion_coeff": 23e-6,
     "ref_temp_sag": 20.0,
-    # --- WIND CORRECTION SETTINGS ---
+    # --- WIND CORRECTION SETTINGS (EXPERIMENTAL) ---
     "wind_max_mps": 7.0,
     "wind_smoothing_window": 3,
     "wind_correction_factor": 0.4,
     # --- DLR CALIBRATION SETTINGS ---
-    "dlr_scaling_factor": 0.80
+    "conservative_derating_factor": 0.80
 }
 
 # ============================================================================
@@ -406,6 +415,16 @@ class WeatherRecord:
     ghi_w_m2: float
 
 def apply_wind_correction(records: List[WeatherRecord], config: Dict) -> List[WeatherRecord]:
+    """
+    EXPERIMENTAL WIND CORRECTION METHODOLOGY:
+    1. Correction Factor (0.4): Adjusts Open-Meteo wind speeds to match Mumbai ground truth.
+    2. Weighted Smoothing (window=3): Removes noise using triangular moving average.
+    3. Clamping (max=7.0 m/s): Prevents unrealistic gusts.
+    
+    This calibration is specific to the Mumbai test corridor and pending
+    site-specific validation. It will be refined or replaced with terrain-based
+    modeling after pilot validation.
+    """
     if not records:
         return records
 
@@ -448,7 +467,7 @@ def apply_wind_correction(records: List[WeatherRecord], config: Dict) -> List[We
     for i, r in enumerate(records):
         r.wind_mps = smoothed_winds[i]
 
-    print(f"🔧 Wind Correction Applied: Factor={factor}, Max={max_mps}m/s, Window={window}hrs")
+    print(f"🔧 Wind Correction Applied: Factor={factor}, Max={max_mps}m/s, Window={window}hrs (EXPERIMENTAL)")
     return records
 
 def fetch_weather_from_openmeteo(lat, lon, start_date, end_date, timezone="auto", forecast=False):
@@ -635,7 +654,7 @@ def update_forecast_cache():
             dlr = solve_dlr(w.ambient_c, wind_perp, w.ghi_w_m2, sp["altitude_deg"], sp["azimuth_deg"],
                             conductor, LINE_AZIMUTH_DEG, attack_deg,
                             CONFIG_DEFAULTS["convection_model"], ROUGHNESS_M, TURB_INTENSITY)
-            scaling = CONFIG_DEFAULTS.get("dlr_scaling_factor", 1.0)
+            scaling = CONFIG_DEFAULTS.get("conservative_derating_factor", 1.0)
             dlr = dlr * scaling
 
             temp_res = solve_temperature(CONFIG_DEFAULTS["test_current"], w.ambient_c, wind_perp, w.ghi_w_m2,
@@ -782,8 +801,8 @@ def run_dlr_for_period_segment(weather_records, conductor, convection_model,
                                          conductor, LINE_AZIMUTH_DEG, attack_deg,
                                          convection_model, ROUGHNESS_M, TURB_INTENSITY)
 
-        # ✅ Apply DLR scaling factor
-        scaling = CONFIG_DEFAULTS.get("dlr_scaling_factor", 1.0)
+        # ✅ Apply conservative derating factor
+        scaling = CONFIG_DEFAULTS.get("conservative_derating_factor", 1.0)
         dlr = dlr * scaling
 
         margin_c = conductor.tmax_c - temp_res["temperature_c"]
@@ -1231,7 +1250,7 @@ if app is not None:
             raise HTTPException(status_code=500, detail=str(e))
 
     # ========================================================================
-    # DASHBOARD HTML (with favicon from external file)
+    # DASHBOARD HTML
     # ========================================================================
     @app.get("/dashboard", response_class=HTMLResponse)
     async def dashboard():
@@ -1480,15 +1499,15 @@ if app is not None:
 
     <!-- Recommendation -->
     <div class="recommendation" id="recommendation">
-        <span class="rec-text">💡 <strong>Operational Recommendation:</strong> You can safely push <strong id="recMw">--</strong> MW of additional power through this line.</span>
-        <span style="font-size:14px;font-weight:500;" id="recStatus">✅ Within limits</span>
+        <span class="rec-text">💡 <strong>Estimated Thermal Headroom:</strong> Conservative estimate suggests <strong id="recMw">--</strong> MW of potential additional thermal capacity above the static rating. <span style="font-size:12px; font-weight:normal; color:#718096;">(Pending site‑specific validation. Network transfer limits may apply.)</span></span>
+        <span style="font-size:14px;font-weight:500;" id="recStatus">📋 Advisory</span>
     </div>
 
     <!-- Metric Grid -->
     <div class="metric-grid" id="metricGrid">
-        <div class="metric-card"><div class="metric-label">Available Capacity</div><div class="metric-value" id="dlr">-- <span class="metric-unit">MW</span></div></div>
-        <div class="metric-card"><div class="metric-label">Headroom vs Static</div><div class="metric-value" id="headroom">-- <span class="metric-unit">MW</span></div></div>
-        <div class="metric-card"><div class="metric-label">Capacity Factor</div><div class="metric-value" id="utilization">--</div></div>
+        <div class="metric-card"><div class="metric-label">Thermal Rating</div><div class="metric-value" id="dlr">-- <span class="metric-unit">A</span></div></div>
+        <div class="metric-card"><div class="metric-label">Conservative Rating</div><div class="metric-value" id="headroom">-- <span class="metric-unit">A</span></div></div>
+        <div class="metric-card"><div class="metric-label">Thermal Capacity Factor</div><div class="metric-value" id="utilization">--</div></div>
         <div class="metric-card"><div class="metric-label">Conductor Temp</div><div class="metric-value" id="temp">-- <span class="metric-unit">°C</span></div></div>
         <div class="metric-card"><div class="metric-label">Ambient</div><div class="metric-value" id="ambient">-- <span class="metric-unit">°C</span></div></div>
         <div class="metric-card"><div class="metric-label">Wind Speed</div><div class="metric-value" id="wind">-- <span class="metric-unit">m/s</span></div></div>
@@ -1520,12 +1539,20 @@ if app is not None:
         <div class="table-wrap"><h3 style="margin-bottom:12px;">📊 Corridor Summary</h3><div id="corridorTable"></div></div>
     </div>
 
-    <div class="footer">&copy; 2026 GridTweak — AI‑Powered Dynamic Line Rating</div>
+    <!-- Footer with footnote -->
+    <div class="footer">
+        <div style="font-size: 11px; color: #718096; margin-bottom: 8px; line-height: 1.6;">
+            ⚡ <strong>Thermal headroom only;</strong> network transfer capability may be constrained by other system limits (stability, N-1 contingencies, protection settings, etc.).
+            <span style="display: inline-block; margin-left: 12px; font-size: 10px; background: #f0f4f8; padding: 2px 8px; border-radius: 12px; color: #4a5568;">Conservative rating = DLR × 0.80 (pending validation)</span>
+        </div>
+        &copy; 2026 GridTweak — AI‑Powered Dynamic Line Rating
+    </div>
 </div>
 
 <script>
     let histChart, forecastChart, dlrBarChart, sagBarChart;
     const voltage = 220, pf = 0.9;
+    const conservativeFactor = 0.80;
 
     function initCharts() {{
         const opts = (title) => ({{
@@ -1569,17 +1596,29 @@ if app is not None:
             const results = data.results;
             const latest = results[results.length-1] || results[0];
             const dlrMW = latest.dlr_mw || ampsToMW(latest.dlr_a);
-            const headroom = dlrMW - staticMW;
+            const headroomMW = dlrMW - staticMW;
+
+            // Thermal Rating (Amps)
+            const dlrAmps = latest.dlr_a || 0;
+            document.getElementById('dlr').innerHTML = dlrAmps.toFixed(0) + ' <span class="metric-unit">A</span>';
+
+            // Conservative Rating (Amps × 0.80)
+            const conservativeAmps = dlrAmps * conservativeFactor;
+            document.getElementById('headroom').innerHTML = conservativeAmps.toFixed(0) + ' <span class="metric-unit">A</span>';
+
+            // Thermal Capacity Factor
             const capFactor = (dlrMW / staticMW * 100);
-            document.getElementById('dlr').innerHTML = dlrMW.toFixed(0) + ' <span class="metric-unit">MW</span>';
-            document.getElementById('headroom').innerHTML = headroom.toFixed(0) + ' <span class="metric-unit">MW</span>';
             document.getElementById('utilization').textContent = capFactor.toFixed(0) + '%';
+
+            // Other metrics
             document.getElementById('temp').innerHTML = (latest.temperature_c || 0).toFixed(1) + ' <span class="metric-unit">°C</span>';
             document.getElementById('ambient').innerHTML = (latest.ambient_c || 0).toFixed(1) + ' <span class="metric-unit">°C</span>';
             document.getElementById('wind').innerHTML = (latest.wind_mps || 0).toFixed(1) + ' <span class="metric-unit">m/s</span>';
             document.getElementById('sag').innerHTML = (latest.sag_m || 0).toFixed(2) + ' <span class="metric-unit">m</span>';
-            document.getElementById('recMw').textContent = headroom.toFixed(0);
-            document.getElementById('recStatus').textContent = headroom > 0 ? '✅ Within limits' : '⚠️ Approaching thermal limit';
+
+            // Recommendation
+            document.getElementById('recMw').textContent = headroomMW.toFixed(0);
+            document.getElementById('recStatus').textContent = headroomMW > 0 ? '📋 Advisory' : '⚠️ Limited';
 
             const timestamps = results.map(r => r.timestamp.slice(11,16));
             const dlrs = results.map(r => r.dlr_mw || ampsToMW(r.dlr_a));
@@ -1735,7 +1774,7 @@ def main():
                 print(f"   static_rating_mw = {CONFIG_DEFAULTS.get('static_rating_mw')}")
                 print(f"   location_name = {CONFIG_DEFAULTS.get('location_name')}")
                 print(f"   wind_correction_factor = {CONFIG_DEFAULTS.get('wind_correction_factor')}")
-                print(f"   dlr_scaling_factor = {CONFIG_DEFAULTS.get('dlr_scaling_factor')}")
+                print(f"   conservative_derating_factor = {CONFIG_DEFAULTS.get('conservative_derating_factor')}")
         except Exception as e:
             print(f"⚠️ Error loading config: {e}. Using defaults.")
     else:
