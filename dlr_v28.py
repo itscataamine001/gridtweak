@@ -7,25 +7,12 @@ GridTweak DLR Engine - V28 (Production Dashboard)
 Full DLR engine with corridor, sag, and auto‑computed static rating.
 Root URL redirects to /dashboard.
 Historical data is limited to 24 hours.
-Zebra/Panther conductors added.
-Wind Speed Clamp + Weighted Smoothing + Correction Factor applied.
-Conservative Derating Factor (0.80) applied for safety margin.
-Location name displayed on dashboard.
-Favicon loaded from favicon_base64.txt (if present).
 
-On startup (API mode):
-- Runs DLR engine once to refresh historical data.
-- Fetches fresh forecast cache.
-- Refreshes forecast every 6 hours.
-
-Dashboard displays:
-- Thermal Rating (Amps)
-- Conservative Rating (Amps, DLR × 0.80)
-- Thermal Capacity Factor
-- Footnote: Thermal headroom only; transfer limits may apply.
-
-Methodology Note: Wind correction is experimental and calibrated for Mumbai.
-Pending site‑specific validation.
+Forecast:
+- Stored as static forecast.json file.
+- Dashboard fetches /static/forecast.json directly.
+- Scheduler updates the file every 6 hours.
+- If fetch fails, old file is kept.
 """
 
 import argparse
@@ -62,7 +49,7 @@ try:
     import fastapi
     import uvicorn
     from fastapi import FastAPI, Query, HTTPException
-    from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
+    from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, FileResponse
     API_AVAILABLE = True
 except ImportError:
     API_AVAILABLE = False
@@ -82,47 +69,6 @@ try:
     ML_AVAILABLE = True
 except ImportError:
     pass
-
-# ============================================================================
-# GLOBAL FORECAST CACHE
-# ============================================================================
-
-_cached_forecast = {
-    "data": None,
-    "last_updated": None
-}
-
-FORECAST_CACHE_FILE = "forecast_cache.json"
-
-def load_forecast_cache_from_file():
-    """Load cached forecast from disk on startup."""
-    global _cached_forecast
-    if os.path.exists(FORECAST_CACHE_FILE):
-        try:
-            with open(FORECAST_CACHE_FILE, 'r') as f:
-                data = json.load(f)
-                _cached_forecast["data"] = data.get("data")
-                _cached_forecast["last_updated"] = data.get("last_updated")
-                record_count = len(_cached_forecast['data']) if _cached_forecast['data'] else 0
-                print(f"✅ Loaded forecast cache from disk ({record_count} records, updated {_cached_forecast['last_updated']})")
-                return True
-        except Exception as e:
-            print(f"⚠️ Could not load forecast cache from disk: {e}")
-    return False
-
-def save_forecast_cache_to_file():
-    """Save cached forecast to disk."""
-    global _cached_forecast
-    try:
-        with open(FORECAST_CACHE_FILE, 'w') as f:
-            json.dump({
-                "data": _cached_forecast["data"],
-                "last_updated": _cached_forecast["last_updated"]
-            }, f)
-        record_count = len(_cached_forecast['data']) if _cached_forecast['data'] else 0
-        print(f"💾 Forecast cache saved to disk ({record_count} records)")
-    except Exception as e:
-        print(f"⚠️ Could not save forecast cache to disk: {e}")
 
 # ============================================================================
 # CONFIGURATION
@@ -164,13 +110,10 @@ CONFIG_DEFAULTS = {
     "sag_ref_m": 5.0,
     "thermal_expansion_coeff": 23e-6,
     "ref_temp_sag": 20.0,
-    # --- TIMEZONE OFFSET (UTC+5.5 for India) ---
     "timezone_offset_hours": 5.5,
-    # --- WIND CORRECTION SETTINGS (EXPERIMENTAL) ---
     "wind_max_mps": 7.0,
     "wind_smoothing_window": 3,
     "wind_correction_factor": 0.4,
-    # --- DLR CALIBRATION SETTINGS ---
     "conservative_derating_factor": 0.80
 }
 
@@ -378,7 +321,6 @@ SOLAR_AZIMUTH = [
 ]
 
 def solar_position(local_hour):
-    """Return solar altitude and azimuth for the given local hour (0-23)."""
     hour = int(round(local_hour)) % 24
     return {"altitude_deg": SOLAR_ALTITUDE[hour], "azimuth_deg": SOLAR_AZIMUTH[hour]}
 
@@ -421,33 +363,18 @@ class WeatherRecord:
     ghi_w_m2: float
 
 def apply_wind_correction(records: List[WeatherRecord], config: Dict) -> List[WeatherRecord]:
-    """
-    EXPERIMENTAL WIND CORRECTION METHODOLOGY:
-    1. Correction Factor (0.4): Adjusts Open-Meteo wind speeds to match Mumbai ground truth.
-    2. Weighted Smoothing (window=3): Removes noise using triangular moving average.
-    3. Clamping (max=7.0 m/s): Prevents unrealistic gusts.
-    
-    This calibration is specific to the Mumbai test corridor and pending
-    site-specific validation. It will be refined or replaced with terrain-based
-    modeling after pilot validation.
-    """
     if not records:
         return records
-
     window = config.get("wind_smoothing_window", 3)
     max_mps = config.get("wind_max_mps", 8.0)
     factor = config.get("wind_correction_factor", 1.0)
-
     if window < 1:
         window = 1
-
     if factor != 1.0:
         for r in records:
             r.wind_mps = r.wind_mps * factor
-
     n = len(records)
     smoothed_winds = [0.0] * n
-
     if window % 2 == 0:
         window += 1
     half = window // 2
@@ -456,7 +383,6 @@ def apply_wind_correction(records: List[WeatherRecord], config: Dict) -> List[We
         weight = half + 1 - abs(i)
         weights.append(weight)
     weight_sum = sum(weights)
-
     for i in range(n):
         total = 0.0
         w_sum = 0.0
@@ -469,10 +395,8 @@ def apply_wind_correction(records: List[WeatherRecord], config: Dict) -> List[We
         if smoothed > max_mps:
             smoothed = max_mps
         smoothed_winds[i] = smoothed
-
     for i, r in enumerate(records):
         r.wind_mps = smoothed_winds[i]
-
     print(f"🔧 Wind Correction Applied: Factor={factor}, Max={max_mps}m/s, Window={window}hrs (EXPERIMENTAL)")
     return records
 
@@ -488,12 +412,9 @@ def fetch_weather_from_openmeteo(lat, lon, start_date, end_date, timezone="auto"
                   "start_date": start_date, "end_date": end_date,
                   "hourly": "temperature_2m,wind_speed_10m,wind_direction_10m,shortwave_radiation",
                   "timezone": timezone}
-    
     url = base_url + "?" + urllib.parse.urlencode(params)
     print(f"Fetching weather from: {url}")
-    
     headers = {'User-Agent': 'GridTweak/1.0 (DLR Platform; contact: hello@gridtweak.com)'}
-    
     max_retries = 5
     base_delay = 3
     for attempt in range(max_retries):
@@ -509,12 +430,10 @@ def fetch_weather_from_openmeteo(lat, lon, start_date, end_date, timezone="auto"
                 time.sleep(delay)
             else:
                 raise RuntimeError(f"Failed to fetch weather after {max_retries} attempts: {e}")
-    
     hourly = data.get("hourly", {})
     times = hourly.get("time", [])
     if not times:
         raise RuntimeError("No times returned from API")
-    
     records = []
     for i, ts in enumerate(times):
         try:
@@ -524,33 +443,23 @@ def fetch_weather_from_openmeteo(lat, lon, start_date, end_date, timezone="auto"
             wind = hourly["wind_speed_10m"][i]
             wdir = hourly["wind_direction_10m"][i]
             ghi = hourly["shortwave_radiation"][i]
-            
             def sanitise(val, default=None):
                 if val is None or not isinstance(val, (int, float)):
                     print(f"⚠️ Missing data at {ts}, using default {default}")
                     return default if default is not None else 0.0
                 return float(val)
-            
             amb = sanitise(amb, 15.0)
             wind = sanitise(wind, 0.0)
             wdir = sanitise(wdir, 0.0)
             ghi = sanitise(ghi, 0.0)
-            
             if wind == 0.0:
                 wdir = 0.0
             if wdir < 0 or wdir >= 360:
                 wdir = 0.0
-            
-            records.append(WeatherRecord(
-                timestamp=ts, 
-                ambient_c=amb, 
-                wind_mps=wind,
-                wind_direction_deg=wdir, 
-                ghi_w_m2=ghi
-            ))
+            records.append(WeatherRecord(timestamp=ts, ambient_c=amb, wind_mps=wind,
+                                         wind_direction_deg=wdir, ghi_w_m2=ghi))
         except (KeyError, IndexError, ValueError) as e:
             print(f"Warning: skipping record at index {i} due to {e}")
-    
     if forecast and start_date and end_date:
         try:
             start_dt = datetime.fromisoformat(start_date)
@@ -566,7 +475,6 @@ def fetch_weather_from_openmeteo(lat, lon, start_date, end_date, timezone="auto"
             records = filtered
         except Exception as e:
             print(f"Warning: date filtering failed: {e}")
-    
     records = apply_wind_correction(records, CONFIG_DEFAULTS)
     return records
 
@@ -592,24 +500,13 @@ def fetch_weather_multi_year(lat, lon, start_date, end_date):
     return all_records
 
 # ============================================================================
-# FORECAST CACHE UPDATE
+# FORECAST UPDATE – writes to forecast.json
 # ============================================================================
 
+FORECAST_FILE = "forecast.json"
+
 def update_forecast_cache():
-    """Fetch forecast from Open-Meteo. If that fails, use archive data (last 7 days)."""
-    global _cached_forecast
-
-    # Check if cache is fresh (< 6 hours old)
-    if _cached_forecast["last_updated"]:
-        try:
-            last_updated = datetime.fromisoformat(_cached_forecast["last_updated"])
-            age = (datetime.now() - last_updated).total_seconds() / 3600
-            if age < 6:
-                print(f"⏭️ Forecast cache is fresh ({age:.1f} hours old). Skipping fetch.")
-                return
-        except:
-            pass
-
+    """Fetch forecast and write to forecast.json. Falls back to archive if forecast fails."""
     try:
         print("🌤️ Updating forecast cache...")
         lat = CONFIG_DEFAULTS["lat"]
@@ -630,11 +527,10 @@ def update_forecast_cache():
         except Exception as e:
             print(f"⚠️ Forecast failed ({e}), trying archive...")
 
-        # ---- Fallback: use archive data (last 7 days) ----
+        # ---- Fallback: archive (7 days) ----
         if not weather:
             try:
-                archive_days = 7
-                archive_start = (datetime.now() - timedelta(days=archive_days)).strftime("%Y-%m-%d")
+                archive_start = (datetime.now() - timedelta(days=7)).strftime("%Y-%m-%d")
                 weather = fetch_weather_from_openmeteo(lat, lon, archive_start, end_date, forecast=False)
                 if weather:
                     data_source = "Archive (fallback)"
@@ -643,10 +539,10 @@ def update_forecast_cache():
                 print(f"❌ Archive fallback also failed: {e}")
 
         if not weather:
-            print("❌ All weather sources failed. Cache not updated.")
+            print("❌ All weather sources failed. forecast.json not updated.")
             return
 
-        # ---- Process weather into DLR results ----
+        # ---- Process ----
         results = []
         for w in weather:
             try:
@@ -671,21 +567,16 @@ def update_forecast_cache():
                 voltage = CONFIG_DEFAULTS.get("nominal_voltage_kv", 220)
                 pf = CONFIG_DEFAULTS.get("power_factor", 0.9)
                 mw = amps_to_mw(dlr, voltage, pf)
-                sag_m = calculate_sag(
-                    temp_res["temperature_c"],
-                    conductor,
-                    CONFIG_DEFAULTS.get("span_length_m", 400),
-                    ref_temp=CONFIG_DEFAULTS.get("ref_temp_sag", 20.0),
-                    sag_ref=CONFIG_DEFAULTS.get("sag_ref_m", 5.0)
-                )
+                sag_m = calculate_sag(temp_res["temperature_c"], conductor,
+                                      CONFIG_DEFAULTS.get("span_length_m", 400),
+                                      ref_temp=CONFIG_DEFAULTS.get("ref_temp_sag", 20.0),
+                                      sag_ref=CONFIG_DEFAULTS.get("sag_ref_m", 5.0))
                 results.append({
                     "timestamp": w.timestamp,
-                    "dlr_a": dlr,
                     "dlr_mw": mw,
                     "temperature_c": temp_res["temperature_c"],
                     "ambient_c": w.ambient_c,
                     "wind_mps": w.wind_mps,
-                    "ghi_w_m2": w.ghi_w_m2,
                     "sag_m": sag_m,
                     "status": "OK" if temp_res["temperature_c"] <= conductor.tmax_c else "OVER"
                 })
@@ -693,14 +584,13 @@ def update_forecast_cache():
                 print(f"⚠️ Skipping record {w.timestamp} due to {e}")
                 continue
 
-        # ---- Save to cache and disk ----
-        _cached_forecast["data"] = results
-        _cached_forecast["last_updated"] = datetime.now().isoformat()
-        save_forecast_cache_to_file()
-        print(f"✅ Forecast cache updated ({data_source}): {len(results)} records at {_cached_forecast['last_updated']}")
+        # ---- Write to file ----
+        with open(FORECAST_FILE, "w") as f:
+            json.dump(results, f, indent=2)
+        print(f"📝 forecast.json written ({len(results)} records) from {data_source}")
 
     except Exception as e:
-        print(f"❌ Forecast cache update failed: {e}. Keeping old cache.")
+        print(f"❌ Forecast update failed: {e}. Keeping existing forecast.json if present.")
 
 # ============================================================================
 # ML MODEL LOADING
@@ -812,19 +702,15 @@ def run_dlr_for_period_segment(weather_records, conductor, convection_model,
                                          conductor, LINE_AZIMUTH_DEG, attack_deg,
                                          convection_model, ROUGHNESS_M, TURB_INTENSITY)
 
-        # ✅ Apply conservative derating factor
         scaling = CONFIG_DEFAULTS.get("conservative_derating_factor", 1.0)
         dlr = dlr * scaling
 
         margin_c = conductor.tmax_c - temp_res["temperature_c"]
         status = "OK" if temp_res["temperature_c"] <= conductor.tmax_c else "OVER"
-        sag_m = calculate_sag(
-            temp_res["temperature_c"],
-            conductor,
-            CONFIG_DEFAULTS.get("span_length_m", 400),
-            ref_temp=CONFIG_DEFAULTS.get("ref_temp_sag", 20.0),
-            sag_ref=CONFIG_DEFAULTS.get("sag_ref_m", 5.0)
-        )
+        sag_m = calculate_sag(temp_res["temperature_c"], conductor,
+                              CONFIG_DEFAULTS.get("span_length_m", 400),
+                              ref_temp=CONFIG_DEFAULTS.get("ref_temp_sag", 20.0),
+                              sag_ref=CONFIG_DEFAULTS.get("sag_ref_m", 5.0))
         result = {
             "timestamp": w.timestamp,
             "ambient_c": w.ambient_c,
@@ -867,18 +753,11 @@ def run_corridor_dlr(lat, lon, end_lat, end_lon, num_segments, conductor, convec
         corrected_weather = []
         for w in weather:
             tc, wc = apply_terrain_correction(w.ambient_c, w.wind_mps, elev, base_elevation)
-            corrected_w = WeatherRecord(
-                timestamp=w.timestamp,
-                ambient_c=tc,
-                wind_mps=wc,
-                wind_direction_deg=w.wind_direction_deg,
-                ghi_w_m2=w.ghi_w_m2
-            )
+            corrected_w = WeatherRecord(timestamp=w.timestamp, ambient_c=tc, wind_mps=wc,
+                                         wind_direction_deg=w.wind_direction_deg, ghi_w_m2=w.ghi_w_m2)
             corrected_weather.append(corrected_w)
-        results = run_dlr_for_period_segment(
-            corrected_weather, conductor, convection_model, test_current,
-            ml_model, use_ml
-        )
+        results = run_dlr_for_period_segment(corrected_weather, conductor, convection_model, test_current,
+                                              ml_model, use_ml)
         min_seg_dlr = min(r["dlr_a"] for r in results)
         min_seg_hour = next(r for r in results if r["dlr_a"] == min_seg_dlr)
         segment_results.append({
@@ -1127,6 +1006,13 @@ if app is not None:
     async def root():
         return RedirectResponse(url="/dashboard")
 
+    # ---- Static forecast endpoint ----
+    @app.get("/static/forecast.json")
+    async def serve_forecast():
+        if os.path.exists("forecast.json"):
+            return FileResponse("forecast.json")
+        return JSONResponse(content=[])
+
     @app.get("/dlr/current")
     async def get_current():
         db_path = CONFIG_DEFAULTS.get("database_path", "dlr_data.db")
@@ -1159,28 +1045,6 @@ if app is not None:
         for run in runs:
             run["results"] = enrich_with_mw(run["results"], voltage, pf)
         return JSONResponse(content=runs)
-
-    @app.get("/dlr/forecast")
-    async def get_forecast():
-        """Return cached forecast data. No live fetching here."""
-        global _cached_forecast
-        if _cached_forecast["data"] is None:
-            return JSONResponse(content={"forecast": []})
-        return JSONResponse(content={"forecast": _cached_forecast["data"]})
-
-    @app.get("/dlr/refresh_forecast")
-    async def refresh_forecast():
-        """Manually trigger a forecast cache update."""
-        try:
-            update_forecast_cache()
-            return {
-                "status": "success",
-                "message": "Forecast cache refreshed",
-                "last_updated": _cached_forecast["last_updated"],
-                "records": len(_cached_forecast["data"]) if _cached_forecast["data"] else 0
-            }
-        except Exception as e:
-            return {"status": "error", "message": str(e)}
 
     @app.get("/dlr/corridor")
     async def get_corridor():
@@ -1275,13 +1139,12 @@ if app is not None:
             raise HTTPException(status_code=500, detail=str(e))
 
     # ========================================================================
-    # DASHBOARD HTML (WITH EMBEDDED FORECAST DATA)
+    # DASHBOARD HTML – fetches static forecast.json
     # ========================================================================
     @app.get("/dashboard", response_class=HTMLResponse)
     async def dashboard():
         location = CONFIG_DEFAULTS.get("location_name", "Transmission Line")
 
-        # Read favicon base64 from file if it exists
         favicon_base64 = ""
         favicon_path = Path("favicon_base64.txt")
         if favicon_path.exists():
@@ -1296,25 +1159,6 @@ if app is not None:
             favicon_tag = f'<link rel="icon" href="data:image/x-icon;base64,{favicon_base64}" type="image/x-icon">'
         else:
             favicon_tag = '<link rel="icon" href="data:,">'
-
-        # --- Get forecast data from cache ---
-        forecast_data = _cached_forecast.get("data")
-        forecast_updated = _cached_forecast.get("last_updated")
-
-        # If cache is empty, try to update once
-        if forecast_data is None:
-            print("⚠️ Forecast cache empty; attempting to refresh...")
-            try:
-                update_forecast_cache()
-                forecast_data = _cached_forecast.get("data")
-                forecast_updated = _cached_forecast.get("last_updated")
-            except Exception as e:
-                print(f"❌ Failed to refresh forecast cache: {e}")
-
-        # Serialize forecast data for JavaScript
-        import json as jsonlib
-        forecast_json = jsonlib.dumps(forecast_data) if forecast_data else "null"
-        forecast_updated_str = forecast_updated if forecast_updated else "null"
 
         html = f"""
 <!DOCTYPE html>
@@ -1526,7 +1370,6 @@ if app is not None:
 </head>
 <body>
 <div class="container">
-    <!-- Header -->
     <div class="header">
         <div>
             <div class="logo">Grid<span>Tweak</span></div>
@@ -1541,13 +1384,11 @@ if app is not None:
         </div>
     </div>
 
-    <!-- Recommendation -->
     <div class="recommendation" id="recommendation">
         <span class="rec-text">💡 <strong>Estimated Thermal Headroom:</strong> Conservative estimate suggests <strong id="recMw">--</strong> MW of potential additional thermal capacity above the static rating. <span style="font-size:12px; font-weight:normal; color:#718096;">(Pending site‑specific validation. Network transfer limits may apply.)</span></span>
         <span style="font-size:14px;font-weight:500;" id="recStatus">📋 Advisory</span>
     </div>
 
-    <!-- Metric Grid -->
     <div class="metric-grid" id="metricGrid">
         <div class="metric-card"><div class="metric-label">Thermal Rating</div><div class="metric-value" id="dlr">-- <span class="metric-unit">A</span></div></div>
         <div class="metric-card"><div class="metric-label">Conservative Rating</div><div class="metric-value" id="headroom">-- <span class="metric-unit">A</span></div></div>
@@ -1558,23 +1399,19 @@ if app is not None:
         <div class="metric-card"><div class="metric-label">Sag</div><div class="metric-value" id="sag">-- <span class="metric-unit">m</span></div></div>
     </div>
 
-    <!-- Tabs -->
     <div class="tabs">
         <button class="tab active" data-tab="historical">Historical (24h)</button>
         <button class="tab" data-tab="forecast">Forecast (7d)</button>
         <button class="tab" data-tab="corridor">Corridor</button>
     </div>
 
-    <!-- Historical Tab -->
     <div id="historical-tab" class="tab-content active">
         <div class="chart-container"><canvas id="historicalChart"></canvas></div>
     </div>
-    <!-- Forecast Tab -->
     <div id="forecast-tab" class="tab-content">
         <div class="chart-container"><canvas id="forecastChart"></canvas></div>
         <div class="table-wrap"><h3 style="margin-bottom:12px;">📈 7‑Day Forecast (MW)</h3><div id="forecastTable"></div></div>
     </div>
-    <!-- Corridor Tab -->
     <div id="corridor-tab" class="tab-content">
         <div class="corridor-grid">
             <div class="corridor-chart"><canvas id="corridorDlrChart"></canvas></div>
@@ -1583,7 +1420,6 @@ if app is not None:
         <div class="table-wrap"><h3 style="margin-bottom:12px;">📊 Corridor Summary</h3><div id="corridorTable"></div></div>
     </div>
 
-    <!-- Footer with footnote -->
     <div class="footer">
         <div style="font-size: 11px; color: #718096; margin-bottom: 8px; line-height: 1.6;">
             ⚡ <strong>Thermal headroom only;</strong> network transfer capability may be constrained by other system limits (stability, N-1 contingencies, protection settings, etc.).
@@ -1594,10 +1430,6 @@ if app is not None:
 </div>
 
 <script>
-    // ----- EMBEDDED FORECAST DATA (from server) -----
-    var embeddedForecast = {forecast_json};
-    var embeddedForecastUpdated = {forecast_updated_str};
-
     let histChart, forecastChart, dlrBarChart, sagBarChart;
     const voltage = 220, pf = 0.9;
     const conservativeFactor = 0.80;
@@ -1687,33 +1519,16 @@ if app is not None:
         histChart.update();
     }}
 
-    // ----- FORECAST: use embedded data, fallback to fetch if empty -----
+    // ---- FORECAST: fetch static JSON ----
     async function fetchForecast() {{
         try {{
-            let results = null;
-            // Try embedded data first
-            if (embeddedForecast && Array.isArray(embeddedForecast) && embeddedForecast.length > 0) {{
-                results = embeddedForecast;
-                console.log('✅ Using embedded forecast data:', results.length, 'records');
-            }} else {{
-                // Fallback: fetch from API
-                const resp = await fetch('/dlr/forecast');
-                if (!resp.ok) {{
-                    const errText = await resp.text();
-                    console.error('Forecast API error:', resp.status, errText);
-                    document.getElementById('forecastTable').innerHTML = `<p style="color:red;">⚠️ Forecast unavailable (${{resp.status}})</p>`;
-                    return;
-                }}
-                const data = await resp.json();
-                if (data && data.forecast && Array.isArray(data.forecast) && data.forecast.length > 0) {{
-                    results = data.forecast;
-                }} else {{
-                    document.getElementById('forecastTable').innerHTML = '<p>No forecast data available for this location.</p>';
-                    return;
-                }}
+            const resp = await fetch('/static/forecast.json');
+            if (!resp.ok) throw new Error('Forecast file not found');
+            const results = await resp.json();
+            if (!results || results.length === 0) {{
+                document.getElementById('forecastTable').innerHTML = '<p>No forecast data available.</p>';
+                return;
             }}
-
-            // Build chart & table from results
             const timestamps = results.map(r => r.timestamp.slice(11,16));
             const dlrs = results.map(r => r.dlr_mw);
             const temps = results.map(r => r.temperature_c);
@@ -1726,7 +1541,6 @@ if app is not None:
             }};
             forecastChart.update();
 
-            // Build table
             let tableHtml = `<table><tr><th>Date</th><th>00:00</th><th>06:00</th><th>12:00</th><th>18:00</th></tr>`;
             const days = {{}};
             results.forEach(r => {{
@@ -1745,10 +1559,9 @@ if app is not None:
             }}
             tableHtml += `</table>`;
             document.getElementById('forecastTable').innerHTML = tableHtml;
-
         }} catch(e) {{
-            console.error('Forecast fetch error:', e);
-            document.getElementById('forecastTable').innerHTML = `<p style="color:red;">⚠️ Failed to load forecast: ${{e.message}}</p>`;
+            console.error('Forecast load error:', e);
+            document.getElementById('forecastTable').innerHTML = '<p>⚠️ Forecast data not loaded yet.</p>';
         }}
     }}
 
@@ -1912,31 +1725,32 @@ def main():
         print(f"Starting {APP_NAME} API server at http://localhost:{args.port}")
         print(f"Dashboard: http://localhost:{args.port}/dashboard")
         
-        # --- Run DLR engine once on startup to refresh historical data ---
+        # --- Run DLR engine once on startup ---
         print("🔄 Running DLR engine to refresh historical data...")
         try:
             run_scheduled_job(CONFIG_DEFAULTS, db_path, ml_model, ml_scaler)
         except Exception as e:
             print(f"⚠️ Initial DLR run failed: {e}")
         
-        # --- FORCE fresh forecast fetch (ignore disk cache) ---
-        print("🌤️ Starting fresh forecast fetch (disk cache ignored)...")
-        try:
-            update_forecast_cache()
-        except Exception as e:
-            print(f"⚠️ Initial forecast fetch failed: {e}. Will retry every 6 hours.")
+        # --- Generate initial forecast.json if missing ---
+        if not os.path.exists("forecast.json"):
+            print("📄 forecast.json not found, generating initial...")
+            try:
+                update_forecast_cache()
+            except Exception as e:
+                print(f"⚠️ Initial forecast generation failed: {e}")
         
-        # --- Schedule periodic refresh (every 6 hours) ---
+        # --- Schedule forecast update every 6 hours ---
         if SCHEDULER_AVAILABLE:
             try:
                 scheduler = BackgroundScheduler()
-                scheduler.add_job(update_forecast_cache, 'interval', hours=6, id='forecast_cache_job')
+                scheduler.add_job(update_forecast_cache, 'interval', hours=6, id='forecast_update')
                 scheduler.start()
-                print("🔄 Forecast cache will refresh every 6 hours.")
+                print("🔄 Forecast file will be updated every 6 hours.")
             except Exception as e:
                 print(f"⚠️ Could not start scheduler: {e}")
         else:
-            print("ℹ️ APScheduler not available. Forecast cache will not auto-refresh.")
+            print("ℹ️ APScheduler not available. Forecast will not auto-update.")
         
         uvicorn.run(app, host="0.0.0.0", port=args.port)
         return 0
