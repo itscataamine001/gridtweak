@@ -12,7 +12,7 @@ Wind Speed Clamp + Weighted Smoothing + Correction Factor applied.
 Conservative Derating Factor (0.80) applied for safety margin.
 Location name displayed on dashboard.
 Favicon loaded from favicon_base64.txt (if present).
-Forecast: file‑based caching with archive fallback – no on‑request fetching.
+Forecast: fetched on startup, refreshed every 6 hours.
 
 Dashboard displays:
 - Thermal Rating (Amps)
@@ -1157,6 +1157,20 @@ if app is not None:
             return JSONResponse(content={"forecast": []})
         return JSONResponse(content={"forecast": _cached_forecast["data"]})
 
+    @app.get("/dlr/refresh_forecast")
+    async def refresh_forecast():
+        """Manually trigger a forecast cache update."""
+        try:
+            update_forecast_cache()
+            return {
+                "status": "success",
+                "message": "Forecast cache refreshed",
+                "last_updated": _cached_forecast["last_updated"],
+                "records": len(_cached_forecast["data"]) if _cached_forecast["data"] else 0
+            }
+        except Exception as e:
+            return {"status": "error", "message": str(e)}
+
     @app.get("/dlr/corridor")
     async def get_corridor():
         try:
@@ -1859,26 +1873,12 @@ def main():
         print(f"Starting {APP_NAME} API server at http://localhost:{args.port}")
         print(f"Dashboard: http://localhost:{args.port}/dashboard")
         
-        # --- Load forecast cache from disk (instant, no API call) ---
-        cache_loaded = load_forecast_cache_from_file()
-        
-        # --- If cache is missing or very old, trigger a background update ---
-        if not cache_loaded:
-            print("🌤️ No disk cache found. Attempting initial fetch...")
-            try:
-                update_forecast_cache()
-            except Exception as e:
-                print(f"⚠️ Initial forecast fetch failed: {e}")
-        else:
-            # Check if cache is stale (> 6 hours) and update in background later
-            try:
-                if _cached_forecast["last_updated"]:
-                    last_updated = datetime.fromisoformat(_cached_forecast["last_updated"])
-                    age = (datetime.now() - last_updated).total_seconds() / 3600
-                    if age > 6:
-                        print(f"⏳ Disk cache is {age:.1f} hours old. Will refresh on next scheduled run.")
-            except:
-                pass
+        # --- FORCE fresh forecast fetch (ignore disk cache) ---
+        print("🌤️ Starting fresh forecast fetch (disk cache ignored)...")
+        try:
+            update_forecast_cache()
+        except Exception as e:
+            print(f"⚠️ Initial forecast fetch failed: {e}. Will retry every 6 hours.")
         
         # --- Schedule periodic refresh (every 6 hours) ---
         if SCHEDULER_AVAILABLE:
@@ -1886,7 +1886,7 @@ def main():
                 scheduler = BackgroundScheduler()
                 scheduler.add_job(update_forecast_cache, 'interval', hours=6, id='forecast_cache_job')
                 scheduler.start()
-                print("🔄 Forecast cache will refresh every 6 hours (if needed).")
+                print("🔄 Forecast cache will refresh every 6 hours.")
             except Exception as e:
                 print(f"⚠️ Could not start scheduler: {e}")
         else:
