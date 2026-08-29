@@ -379,7 +379,6 @@ SOLAR_AZIMUTH = [
 
 def solar_position(local_hour):
     """Return solar altitude and azimuth for the given local hour (0-23)."""
-    # Ensure hour is an integer in 0-23 range
     hour = int(round(local_hour)) % 24
     return {"altitude_deg": SOLAR_ALTITUDE[hour], "azimuth_deg": SOLAR_AZIMUTH[hour]}
 
@@ -653,7 +652,6 @@ def update_forecast_cache():
             try:
                 dt = datetime.fromisoformat(w.timestamp)
                 offset = CONFIG_DEFAULTS.get("timezone_offset_hours", 0)
-                # ✅ FIX: Convert to integer and ensure 0-23 range
                 local_hour = int(round((dt.hour + offset) % 24)) % 24
                 sp = solar_position(local_hour)
                 geo = wind_geometry(w.wind_mps, w.wind_direction_deg, LINE_AZIMUTH_DEG)
@@ -1277,7 +1275,7 @@ if app is not None:
             raise HTTPException(status_code=500, detail=str(e))
 
     # ========================================================================
-    # DASHBOARD HTML
+    # DASHBOARD HTML (WITH EMBEDDED FORECAST DATA)
     # ========================================================================
     @app.get("/dashboard", response_class=HTMLResponse)
     async def dashboard():
@@ -1298,6 +1296,25 @@ if app is not None:
             favicon_tag = f'<link rel="icon" href="data:image/x-icon;base64,{favicon_base64}" type="image/x-icon">'
         else:
             favicon_tag = '<link rel="icon" href="data:,">'
+
+        # --- Get forecast data from cache ---
+        forecast_data = _cached_forecast.get("data")
+        forecast_updated = _cached_forecast.get("last_updated")
+
+        # If cache is empty, try to update once
+        if forecast_data is None:
+            print("⚠️ Forecast cache empty; attempting to refresh...")
+            try:
+                update_forecast_cache()
+                forecast_data = _cached_forecast.get("data")
+                forecast_updated = _cached_forecast.get("last_updated")
+            except Exception as e:
+                print(f"❌ Failed to refresh forecast cache: {e}")
+
+        # Serialize forecast data for JavaScript
+        import json as jsonlib
+        forecast_json = jsonlib.dumps(forecast_data) if forecast_data else "null"
+        forecast_updated_str = forecast_updated if forecast_updated else "null"
 
         html = f"""
 <!DOCTYPE html>
@@ -1577,6 +1594,10 @@ if app is not None:
 </div>
 
 <script>
+    // ----- EMBEDDED FORECAST DATA (from server) -----
+    var embeddedForecast = {forecast_json};
+    var embeddedForecastUpdated = {forecast_updated_str};
+
     let histChart, forecastChart, dlrBarChart, sagBarChart;
     const voltage = 220, pf = 0.9;
     const conservativeFactor = 0.80;
@@ -1625,25 +1646,16 @@ if app is not None:
             const dlrMW = latest.dlr_mw || ampsToMW(latest.dlr_a);
             const headroomMW = dlrMW - staticMW;
 
-            // Thermal Rating (Amps)
             const dlrAmps = latest.dlr_a || 0;
             document.getElementById('dlr').innerHTML = dlrAmps.toFixed(0) + ' <span class="metric-unit">A</span>';
-
-            // Conservative Rating (Amps × 0.80)
             const conservativeAmps = dlrAmps * conservativeFactor;
             document.getElementById('headroom').innerHTML = conservativeAmps.toFixed(0) + ' <span class="metric-unit">A</span>';
-
-            // Thermal Capacity Factor
             const capFactor = (dlrMW / staticMW * 100);
             document.getElementById('utilization').textContent = capFactor.toFixed(0) + '%';
-
-            // Other metrics
             document.getElementById('temp').innerHTML = (latest.temperature_c || 0).toFixed(1) + ' <span class="metric-unit">°C</span>';
             document.getElementById('ambient').innerHTML = (latest.ambient_c || 0).toFixed(1) + ' <span class="metric-unit">°C</span>';
             document.getElementById('wind').innerHTML = (latest.wind_mps || 0).toFixed(1) + ' <span class="metric-unit">m/s</span>';
             document.getElementById('sag').innerHTML = (latest.sag_m || 0).toFixed(2) + ' <span class="metric-unit">m</span>';
-
-            // Recommendation
             document.getElementById('recMw').textContent = headroomMW.toFixed(0);
             document.getElementById('recStatus').textContent = headroomMW > 0 ? '📋 Advisory' : '⚠️ Limited';
 
@@ -1675,22 +1687,33 @@ if app is not None:
         histChart.update();
     }}
 
+    // ----- FORECAST: use embedded data, fallback to fetch if empty -----
     async function fetchForecast() {{
         try {{
-            const resp = await fetch('/dlr/forecast');
-            if (!resp.ok) {{
-                const errText = await resp.text();
-                console.error('Forecast API error:', resp.status, errText);
-                document.getElementById('forecastTable').innerHTML = `<p style="color:red;">⚠️ Forecast unavailable (${{resp.status}})</p>`;
-                return;
+            let results = null;
+            // Try embedded data first
+            if (embeddedForecast && Array.isArray(embeddedForecast) && embeddedForecast.length > 0) {{
+                results = embeddedForecast;
+                console.log('✅ Using embedded forecast data:', results.length, 'records');
+            }} else {{
+                // Fallback: fetch from API
+                const resp = await fetch('/dlr/forecast');
+                if (!resp.ok) {{
+                    const errText = await resp.text();
+                    console.error('Forecast API error:', resp.status, errText);
+                    document.getElementById('forecastTable').innerHTML = `<p style="color:red;">⚠️ Forecast unavailable (${{resp.status}})</p>`;
+                    return;
+                }}
+                const data = await resp.json();
+                if (data && data.forecast && Array.isArray(data.forecast) && data.forecast.length > 0) {{
+                    results = data.forecast;
+                }} else {{
+                    document.getElementById('forecastTable').innerHTML = '<p>No forecast data available for this location.</p>';
+                    return;
+                }}
             }}
-            const data = await resp.json();
-            console.log('✅ Forecast data (cached):', data);
-            if (!data || !data.forecast || data.forecast.length === 0) {{
-                document.getElementById('forecastTable').innerHTML = '<p>No forecast data available for this location.</p>';
-                return;
-            }}
-            const results = data.forecast;
+
+            // Build chart & table from results
             const timestamps = results.map(r => r.timestamp.slice(11,16));
             const dlrs = results.map(r => r.dlr_mw);
             const temps = results.map(r => r.temperature_c);
@@ -1702,6 +1725,8 @@ if app is not None:
                 ]
             }};
             forecastChart.update();
+
+            // Build table
             let tableHtml = `<table><tr><th>Date</th><th>00:00</th><th>06:00</th><th>12:00</th><th>18:00</th></tr>`;
             const days = {{}};
             results.forEach(r => {{
@@ -1720,6 +1745,7 @@ if app is not None:
             }}
             tableHtml += `</table>`;
             document.getElementById('forecastTable').innerHTML = tableHtml;
+
         }} catch(e) {{
             console.error('Forecast fetch error:', e);
             document.getElementById('forecastTable').innerHTML = `<p style="color:red;">⚠️ Failed to load forecast: ${{e.message}}</p>`;
