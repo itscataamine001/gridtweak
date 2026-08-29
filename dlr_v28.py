@@ -12,7 +12,11 @@ Wind Speed Clamp + Weighted Smoothing + Correction Factor applied.
 Conservative Derating Factor (0.80) applied for safety margin.
 Location name displayed on dashboard.
 Favicon loaded from favicon_base64.txt (if present).
-Forecast: fetched on startup, refreshed every 6 hours.
+
+On startup (API mode):
+- Runs DLR engine once to refresh historical data.
+- Fetches fresh forecast cache.
+- Refreshes forecast every 6 hours.
 
 Dashboard displays:
 - Thermal Rating (Amps)
@@ -1872,6 +1876,13 @@ def main():
         
         print(f"Starting {APP_NAME} API server at http://localhost:{args.port}")
         print(f"Dashboard: http://localhost:{args.port}/dashboard")
+        
+        # --- Run DLR engine once on startup to refresh historical data ---
+        print("🔄 Running DLR engine to refresh historical data...")
+        try:
+            run_scheduled_job(CONFIG_DEFAULTS, db_path, ml_model, ml_scaler)
+        except Exception as e:
+            print(f"⚠️ Initial DLR run failed: {e}")
         
         # --- FORCE fresh forecast fetch (ignore disk cache) ---
         print("🌤️ Starting fresh forecast fetch (disk cache ignored)...")
