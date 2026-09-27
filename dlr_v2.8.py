@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-GridTweak DLR Engine - V2.13
-Pre-baked cache friendly: /dlr/current and /dlr/corridor fall back to cache
-when Open-Meteo is rate-limited. Startup serves pre-built cache instantly.
+GridTweak DLR Engine - V2.13.1
+Cache-first serving: /dlr/current and /dlr/corridor return instantly from
+the pre-built cache. Live fetch only runs if no cache exists.
 """
 
 import argparse, json, math, sys, os, shutil, warnings, time, threading, traceback, re
@@ -239,7 +239,7 @@ def maybe_auto_fresh():
 # ============================================================================
 # CONFIG
 # ============================================================================
-VERSION = "V2.13"
+VERSION = "V2.13.1"
 APP_NAME = "GridTweak"
 
 CONFIG_DEFAULTS = {
@@ -1235,27 +1235,39 @@ if app is not None:
         c = get_conductor(CONFIG_DEFAULTS["conductor"])
         end = datetime.now().strftime("%Y-%m-%d")
         start = (datetime.now() - timedelta(days=1)).strftime("%Y-%m-%d")
-        res = []
-        source = "live"
+        kv = CONFIG_DEFAULTS["nominal_voltage_kv"]; pf = CONFIG_DEFAULTS["power_factor"]
+        static_a = compute_static_rating_A(c)
+        static_mw = amps_to_mw(static_a, kv, pf)
+
+        # Cache-first: if we have data, serve it instantly. No live fetch.
+        cached = _cached.get("data") or []
+        if cached:
+            res = list(cached[-24:]) if len(cached) > 24 else list(cached)
+            for r in res:
+                r["dlr_mw"] = _s(amps_to_mw(r["dlr_a"], kv, pf))
+            return JSONResponse(content=_san({
+                "results": res, "static_rating_mw": static_mw, "static_rating_a": static_a,
+                "location_name": CONFIG_DEFAULTS["location_name"],
+                "source": "cache"}))
+
+        # No cache — fall through to live fetch
         try:
             w = fetch_weather_multi_year(lat, lon, start, end)
             res = run_dlr_records(w, c)
         except Exception as e:
-            print(f"/dlr/current live fetch failed: {e} — using cache")
-            source = "cache"
-            cached = _cached.get("data") or []
-            res = list(cached[-24:]) if len(cached) > 24 else list(cached)
+            print(f"/dlr/current live fetch failed: {e}")
+            return JSONResponse(content=_san({
+                "results": [], "static_rating_mw": static_mw, "static_rating_a": static_a,
+                "location_name": CONFIG_DEFAULTS["location_name"],
+                "source": "error", "error": str(e)}))
 
         if len(res) > 24: res = res[-24:]
-        kv = CONFIG_DEFAULTS["nominal_voltage_kv"]; pf = CONFIG_DEFAULTS["power_factor"]
         for r in res:
             r["dlr_mw"] = _s(amps_to_mw(r["dlr_a"], kv, pf))
-        static_a = compute_static_rating_A(c)
-        static_mw = amps_to_mw(static_a, kv, pf)
         return JSONResponse(content=_san({
             "results": res, "static_rating_mw": static_mw, "static_rating_a": static_a,
             "location_name": CONFIG_DEFAULTS["location_name"],
-            "source": source}))
+            "source": "live"}))
 
     @app.get("/dlr/forecast")
     async def get_forecast():
@@ -1277,16 +1289,44 @@ if app is not None:
 
     @app.get("/dlr/corridor")
     async def get_corridor():
+        lat = CONFIG_DEFAULTS["lat"]; lon = CONFIG_DEFAULTS["lon"]
+        elat = CONFIG_DEFAULTS.get("end_lat") or (lat + 0.5)
+        elon = CONFIG_DEFAULTS.get("end_lon") or (lon + 0.5)
+        nseg = CONFIG_DEFAULTS.get("num_segments", 3)
+        c = get_conductor(CONFIG_DEFAULTS["conductor"])
+        kv = CONFIG_DEFAULTS["nominal_voltage_kv"]; pf = CONFIG_DEFAULTS["power_factor"]
+
+        # Cache-first: synthesize segments instantly from cache worst-case.
+        cached = _cached.get("data") or []
+        if cached:
+            try:
+                mnh = min(cached, key=lambda r: (r.get("dlr_a") or 9999))
+            except Exception:
+                mnh = cached[0]
+            seg_list = []
+            for i in range(nseg + 1):
+                slat = lat + (elat - lat) * i / nseg
+                slon = lon + (elon - lon) * i / nseg
+                seg_list.append({
+                    "lat": slat, "lon": slon, "elevation_m": 0,
+                    "min_dlr_mw": _s(amps_to_mw(mnh.get("dlr_a", 0), kv, pf)),
+                    "temperature_c": mnh.get("dlr_temp_c", 85.0),
+                    "sag_m": mnh.get("dlr_sag_m", 0.0),
+                    "clearance_m": mnh.get("dlr_clearance_m", 0.0),
+                    "binding_constraint": mnh.get("binding_constraint", "thermal"),
+                    "worst_hour": mnh.get("timestamp", ""),
+                })
+            return JSONResponse(content=_san({
+                "min_dlr_mw": seg_list[0]["min_dlr_mw"] if seg_list else 0,
+                "weakest_segment": 0,
+                "segments": seg_list,
+                "source": "cache"}))
+
+        # No cache — fall through to live corridor walk
         try:
-            lat = CONFIG_DEFAULTS["lat"]; lon = CONFIG_DEFAULTS["lon"]
-            elat = CONFIG_DEFAULTS.get("end_lat") or (lat + 0.5)
-            elon = CONFIG_DEFAULTS.get("end_lon") or (lon + 0.5)
-            nseg = CONFIG_DEFAULTS.get("num_segments", 3)
-            c = get_conductor(CONFIG_DEFAULTS["conductor"])
             start = (datetime.now() - timedelta(days=1)).strftime("%Y-%m-%d")
             end = datetime.now().strftime("%Y-%m-%d")
             segs, mn, weak = run_corridor(lat, lon, elat, elon, nseg, c, start, end, forecast=False)
-            kv = CONFIG_DEFAULTS["nominal_voltage_kv"]; pf = CONFIG_DEFAULTS["power_factor"]
             return JSONResponse(content=_san({
                 "min_dlr_mw": _s(amps_to_mw(mn, kv, pf)),
                 "weakest_segment": weak,
@@ -1424,7 +1464,7 @@ GridTweak's parabolic sag model compared against published sag values from PGCIL
 <div class="footer">
 <div style="font-size:11px;color:#718096;margin-bottom:8px;line-height:1.6;">
 Thermal headroom only. Network transfer capability may be constrained by other system limits.
-<span style="display:inline-block;margin-left:12px;font-size:10px;background:#f0f4f8;padding:2px 8px;border-radius:12px;color:#4a5568;">V2.13 | IEEE 738 | Sag benchmarks</span>
+<span style="display:inline-block;margin-left:12px;font-size:10px;background:#f0f4f8;padding:2px 8px;border-radius:12px;color:#4a5568;">V2.13.1 | IEEE 738 | Sag benchmarks</span>
 </div>
 &copy; 2026 GridTweak
 </div></div>
