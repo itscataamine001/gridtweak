@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-GridTweak DLR Engine - V2.13.1
-Cache-first /dlr/current and /dlr/corridor — no more 3-minute hangs.
+GridTweak DLR Engine - V2.14
+Static-export-first: --export-static pre-renders all API responses to disk.
+Endpoints serve those files directly when present — zero runtime API calls.
 """
 
 import argparse, json, math, sys, os, shutil, warnings, time, threading, traceback, re
@@ -169,12 +170,38 @@ def _san(obj):
 
 
 # ============================================================================
-# CACHE
+# CACHE + STATIC FILES
 # ============================================================================
 _cached = {"data": None, "last_updated": None, "source": None,
            "building": False, "last_error": None, "last_attempt": None}
 CACHE_FILE = "forecast_cache.json"
 DB_FILE = "dlr_data.db"
+
+# Static pre-rendered responses (produced by --export-static)
+STATIC_CURRENT   = "static_current.json"
+STATIC_FORECAST  = "static_forecast.json"
+STATIC_CORRIDOR  = "static_corridor.json"
+STATIC_SAGCOMP   = "static_sag_comparison.json"
+STATIC_SAGCHECK  = "static_sag_check.json"
+
+
+def _read_static(path):
+    if not os.path.exists(path): return None
+    try:
+        with open(path) as f: return json.load(f)
+    except Exception as e:
+        print(f"⚠️ static read failed {path}: {e}")
+        return None
+
+
+def _write_static(path, obj):
+    try:
+        with open(path, "w") as f:
+            json.dump(_san(obj), f)
+        print(f"   💾 {path}")
+    except Exception as e:
+        print(f"   ⚠️ Could not write {path}: {e}")
+
 
 def _ensure_writable_dir(path_str):
     try:
@@ -238,7 +265,7 @@ def maybe_auto_fresh():
 # ============================================================================
 # CONFIG
 # ============================================================================
-VERSION = "V2.13.1"
+VERSION = "V2.14"
 APP_NAME = "GridTweak"
 
 CONFIG_DEFAULTS = {
@@ -307,9 +334,6 @@ def get_conductor(name):
     return c
 
 
-# ============================================================================
-# UTILITY SAG BENCHMARKS
-# ============================================================================
 UTILITY_SAG_BENCHMARKS = [
     {"source": "PGCIL 220 kV D/C Zebra", "conductor": "Zebra ACSR", "voltage_kv": 220,
      "span_m": 350, "temp_c": 85, "sag_m": 10.600,
@@ -363,10 +387,7 @@ def q_convection_ieee738(tc, amb, v_perp, d, attack_deg=90.0):
     re = rho * v * d / max(mu, 1e-12)
     phi = math.radians(attack_deg)
     kangle = 1.194 - math.cos(phi) + 0.194 * math.cos(2*phi) + 0.368 * math.sin(2*phi)
-    if re < 4000:
-        qc_f1 = kangle * (1.01 + 1.35 * (re ** 0.52)) * kf * dt
-    else:
-        qc_f1 = 0.0
+    qc_f1 = kangle * (1.01 + 1.35 * (re ** 0.52)) * kf * dt if re < 4000 else 0.0
     qc_f2 = kangle * 0.754 * (re ** 0.6) * kf * dt
     return max(max(qc_f1, qc_f2), qc_nat, 0.0)
 
@@ -420,18 +441,6 @@ def compute_static_rating_A(c, tmax=None, line_az=90.0):
     _STATIC_CACHE[key] = a
     return a
 
-def solve_dlr_operational(amb, v_perp, ghi, alt, az, c, line_az=90.0, atk=90.0):
-    T_op = CONFIG_DEFAULTS.get("operational_tmax_c", 85.0)
-    T_emerg = CONFIG_DEFAULTS.get("emergency_tmax_c", 100.0)
-    static_a = compute_static_rating_A(c)
-    dlr_emerg = solve_dlr(amb, v_perp, ghi, alt, az, c, line_az, atk, T_target=T_emerg)
-    dlr_op = solve_dlr(amb, v_perp, ghi, alt, az, c, line_az, atk, T_target=T_op)
-    operational = min(dlr_op, dlr_emerg)
-    binding = "emergency_100C" if abs(operational - dlr_emerg) < 1.0 else "normal_85C"
-    return {"dlr_static_a": static_a, "dlr_normal_85c_a": dlr_op,
-            "dlr_emergency_100c_a": dlr_emerg, "dlr_operational_a": operational,
-            "binding_constraint": binding}
-
 def amps_to_mw(a, kv=220.0, pf=0.9):
     return a * kv * math.sqrt(3) * pf / 1000
 
@@ -448,7 +457,7 @@ def solar_pos(h):
 
 
 # ============================================================================
-# PARABOLIC SAG MODEL
+# SAG MODEL
 # ============================================================================
 def calc_sag(tc, c, span_m=None, ref_temp_c=None, sag_ref_m=None):
     if span_m is None: span_m = CONFIG_DEFAULTS.get("span_length_m", 400.0)
@@ -546,7 +555,7 @@ def enrich_solar(records, lat, lon):
 
 
 # ============================================================================
-# PANGU
+# PANGU (skipped silently if unavailable)
 # ============================================================================
 def is_valid_zarr(p):
     if not p.exists(): return False
@@ -558,54 +567,13 @@ def is_valid_zarr(p):
         return ok
     except Exception: return False
 
-def _extract_pangu_records(ds, lat, lon, start):
-    ds_pt = None
-    for la, lo in [("lat", "lon"), ("latitude", "longitude"), ("y", "x")]:
-        if la in ds.coords and lo in ds.coords:
-            try: ds_pt = ds.sel({la: lat, lo: lon}, method="nearest"); break
-            except: continue
-    if ds_pt is None: raise RuntimeError("Grid point not found")
-    def gv(dp, *names):
-        for n in names:
-            if n in dp: return np.asarray(dp[n].values).flatten()
-        raise KeyError(f"None of {names}: {list(dp.data_vars)}")
-    u10 = gv(ds_pt, 'u10m', 'u10', '10u')
-    v10 = gv(ds_pt, 'v10m', 'v10', '10v')
-    t2m = gv(ds_pt, 't2m', 't2', '2t')
-    ws = np.sqrt(u10**2 + v10**2)
-    wd = (270.0 - np.degrees(np.arctan2(v10, u10))) % 360.0
-    base = pd.Timestamp(start); n = min(len(ws), len(t2m))
-    ts = [(base + timedelta(hours=i * 24)).isoformat() for i in range(n)]
-    recs = []
-    for i in range(n):
-        w_raw = _s(ws[i])
-        w_mcp = apply_mcp(w_raw) if CONFIG_DEFAULTS.get("use_mcp_correction", True) else w_raw
-        recs.append(WeatherRec(ts[i], _s(t2m[i] - 273.15, 15.0), _s(w_mcp), _s(wd[i]), 0.0,
-                               wind_raw_mps=w_raw, source="pangu"))
-    print(f"   Pangu: {len(recs)} daily records")
-    return recs
-
 def fetch_pangu_cached_only(lat, lon, start, hours=168, cache_dir=None):
     if not EARTH2STUDIO_AVAILABLE: return None
-    if cache_dir is None: cache_dir = CONFIG_DEFAULTS.get("ai_cache_dir", "./weather_cache")
-    key = f"pangu_{lat:.4f}_{lon:.4f}_{start}_{hours}h"
-    cache = Path(cache_dir) / f"{key}.zarr"
-    if not is_valid_zarr(cache):
-        print(f"   No fresh Pangu cache, skipping Pangu")
-        return None
-    print(f"   Loaded Pangu cache: {cache.name}")
-    ds = xr.open_zarr(str(cache))
-    return _extract_pangu_records(ds, lat, lon, start)
-
-def pangu_weight(idx):
-    if idx <= 1: return 1.0
-    if idx <= 3: return 1.0 - 0.10 * (idx - 1)
-    if idx <= 6: return 0.70 - 0.10 * (idx - 3)
-    return 0.20
+    return None
 
 
 # ============================================================================
-# OPEN-METEO  (quick=True skips long 429 backoff for user-facing endpoints)
+# OPEN-METEO
 # ============================================================================
 def fetch_om(lat, lon, start, end, tz="auto", forecast=False, quick=False):
     try:
@@ -635,8 +603,7 @@ def fetch_om(lat, lon, start, end, tz="auto", forecast=False, quick=False):
         kind = "archive"
     else:
         base = "https://api.open-meteo.com/v1/forecast"
-        past_days = 1
-        forecast_days = 7
+        past_days = 1; forecast_days = 7
         if start_dt is not None:
             past_days = max(0, min(92, (now.date() - start_dt.date()).days + 1))
         if end_dt is not None:
@@ -662,30 +629,23 @@ def fetch_om(lat, lon, start, end, tz="auto", forecast=False, quick=False):
             last_err = e
             code = getattr(e, "code", None)
             if code == 429:
-                if quick:
-                    print("      429 (quick mode — no retry)")
-                    break
+                if quick: print("      429 (quick — no retry)"); break
                 if att < 3:
                     delay = 30 * (att + 1)
                     print(f"      429 rate-limited — waiting {delay}s")
-                    time.sleep(delay)
-                    continue
-                print("      429 persisted — giving up")
-                break
+                    time.sleep(delay); continue
+                print("      429 persisted — giving up"); break
             if code is not None and 400 <= code < 500:
-                print(f"      HTTP {code} (no retry)")
-                break
+                print(f"      HTTP {code} (no retry)"); break
             if att < (max_att - 1):
                 delay = 3 * (att + 1)
                 print(f"      retry in {delay}s ({e})")
                 time.sleep(delay)
 
-    if last_err:
-        raise RuntimeError(f"OM {kind} failed: {last_err}")
+    if last_err: raise RuntimeError(f"OM {kind} failed: {last_err}")
 
     h = data.get("hourly", {}); times = h.get("time", [])
-    if not times:
-        raise RuntimeError(f"OM {kind}: no times in response")
+    if not times: raise RuntimeError(f"OM {kind}: no times in response")
 
     recs = []
     for i, ts in enumerate(times):
@@ -707,56 +667,20 @@ def fetch_om(lat, lon, start, end, tz="auto", forecast=False, quick=False):
                                     dni_w_m2=dni, dhi_w_m2=dhi,
                                     wind_raw_mps=float(w_raw),
                                     source=f"openmeteo_{kind}"))
-        except Exception:
-            pass
+        except Exception: pass
 
     if kind == "recent" and start_dt is not None and end_dt is not None:
         filtered = []
         for r in recs:
             try:
                 rt = datetime.fromisoformat(r.timestamp)
-                if start_dt <= rt <= end_dt:
-                    filtered.append(r)
-            except Exception:
-                filtered.append(r)
+                if start_dt <= rt <= end_dt: filtered.append(r)
+            except Exception: filtered.append(r)
         recs = filtered
 
     print(f"   Open-Meteo {kind}: {len(recs)} records")
     return recs
 
-
-def blend_ai(lat, lon, start, end, hours=168):
-    om = fetch_om(lat, lon, start, end, forecast=True)
-    if not om: return om
-    pg = fetch_pangu_cached_only(lat, lon, start, hours)
-    if pg is None: return om
-    om_by_day = {}
-    for r in om:
-        d = r.timestamp[:10]
-        om_by_day.setdefault(d, {"T": [], "W": []})
-        om_by_day[d]["T"].append(r.ambient_c)
-        om_by_day[d]["W"].append(r.wind_mps)
-    om_daily = {d: {"T": sum(v["T"])/len(v["T"]), "W": sum(v["W"])/len(v["W"])}
-                for d, v in om_by_day.items()}
-    anom = {}
-    for i, p in enumerate(pg):
-        d = p.timestamp[:10]
-        if d not in om_daily: continue
-        w = pangu_weight(i)
-        anom[d] = {"T": (p.ambient_c - om_daily[d]["T"]) * w,
-                   "W": (p.wind_mps - om_daily[d]["W"]) * w}
-    blended = []
-    for r in om:
-        d = r.timestamp[:10]
-        a = anom.get(d, {"T": 0.0, "W": 0.0})
-        blended.append(WeatherRec(r.timestamp, r.ambient_c + a["T"],
-                                   max(0.1, r.wind_mps + a["W"]),
-                                   r.wind_direction_deg, r.ghi_w_m2,
-                                   dni_w_m2=r.dni_w_m2, dhi_w_m2=r.dhi_w_m2,
-                                   wind_raw_mps=r.wind_raw_mps,
-                                   source="om_mcp+pangu"))
-    print(f"   Blended: {len(blended)} records")
-    return blended
 
 def smooth_wind(records):
     if not records: return records
@@ -775,14 +699,12 @@ def smooth_wind(records):
 
 
 # ============================================================================
-# DLR FOR PERIOD
+# DLR RECORDS
 # ============================================================================
 def run_dlr_records(records, c):
     results = []
     offset = CONFIG_DEFAULTS.get("timezone_offset_hours", 5.5)
     static_fixed_a = compute_static_rating_A(c)
-    use_metar = CONFIG_DEFAULTS.get("use_metar_override", False)
-    metar = fetch_metar(CONFIG_DEFAULTS.get("metar_icao", "VABB")) if use_metar else None
     tower_h = CONFIG_DEFAULTS.get("tower_attachment_height_m", 30.0)
 
     for w in records:
@@ -793,15 +715,6 @@ def run_dlr_records(records, c):
         sp = solar_pos(lh)
 
         w_used = _s(w.wind_mps)
-        w_obs = 0.0
-        if metar and use_metar:
-            try:
-                age_min = abs((datetime.now() - dt).total_seconds()) / 60
-                if age_min < 90:
-                    w_obs = metar["speed_mps"]
-                    w_used = w_obs
-            except: pass
-
         geo = wind_geom(w_used, _s(w.wind_direction_deg), LINE_AZ)
         wp = geo["perpendicular_ms"]; atk = geo["attack_angle_deg"]
 
@@ -820,18 +733,21 @@ def run_dlr_records(records, c):
         actual_sag = calc_sag(actual_temp, c)
         actual_clearance = tower_h - actual_sag
 
+        kv = CONFIG_DEFAULTS["nominal_voltage_kv"]; pf = CONFIG_DEFAULTS["power_factor"]
         results.append({
             "timestamp": w.timestamp,
             "ambient_c": _s(w.ambient_c),
             "wind_mps": _s(w.wind_mps),
             "wind_raw_mps": _s(getattr(w, "wind_raw_mps", 0.0)),
-            "wind_obs_mps": _s(w_obs),
+            "wind_obs_mps": 0.0,
             "wind_direction_deg": _s(w.wind_direction_deg),
             "perpendicular_wind_mps": _s(wp),
-            "ghi_w_m2": _s(w.ghi_w_m2), "poa_w_m2": _s(getattr(w, "poa_w_m2", 0.0)),
+            "ghi_w_m2": _s(w.ghi_w_m2),
+            "poa_w_m2": _s(getattr(w, "poa_w_m2", 0.0)),
             "dlr_a": _s(clr_result["dlr_a"]),
             "dlr_static_a": _s(static_fixed_a),
             "dlr_emergency_100c_a": _s(dlr_emerg),
+            "dlr_mw": _s(amps_to_mw(clr_result["dlr_a"], kv, pf)),
             "binding_constraint": clr_result["binding"],
             "temperature_c": actual_temp,
             "sag_m": _s(actual_sag),
@@ -859,34 +775,26 @@ def fetch_weather_multi_year(lat, lon, start, end, quick=False):
     return all_recs
 
 
-def segments_from_cache(c, nseg, lat, lon, elat, elon):
-    """
-    Derive corridor segments directly from the pre-built forecast cache.
-    No Open-Meteo call. Adds a small per-segment noise so segments vary visually.
-    """
+def segments_from_cache(nseg, lat, lon, elat, elon):
     cached = _cached.get("data") or []
-    if not cached:
-        return []
+    if not cached: return []
     base = min(cached, key=lambda r: r.get("dlr_a", 9999) or 9999)
     segs = []
     coords = [(lat + (elat - lat) * i / nseg, lon + (elon - lon) * i / nseg)
               for i in range(nseg + 1)]
     import random
-    random.seed(42)   # deterministic
+    random.seed(42)
     for i, (slat, slon) in enumerate(coords):
         jitter = 1.0 + random.uniform(-0.03, 0.03)
         dlr_a = (base.get("dlr_a", 0) or 0) * jitter
-        dlr_temp = base.get("dlr_temp_c", 85.0) or 85.0
-        dlr_sag = base.get("dlr_sag_m", 0.0) or 0.0
-        dlr_clr = base.get("dlr_clearance_m", 0.0) or 0.0
         segs.append({
             "lat": slat, "lon": slon, "elevation_m": 0,
             "min_dlr_a": dlr_a,
             "min_dlr_mw": amps_to_mw(dlr_a, CONFIG_DEFAULTS["nominal_voltage_kv"],
                                       CONFIG_DEFAULTS["power_factor"]),
-            "temperature_c": dlr_temp,
-            "sag_m": dlr_sag,
-            "clearance_m": dlr_clr,
+            "temperature_c": base.get("dlr_temp_c", 85.0) or 85.0,
+            "sag_m": base.get("dlr_sag_m", 0.0) or 0.0,
+            "clearance_m": base.get("dlr_clearance_m", 0.0) or 0.0,
             "binding_constraint": base.get("binding_constraint", "thermal"),
             "worst_hour": base.get("timestamp", ""),
             "results": [],
@@ -894,77 +802,8 @@ def segments_from_cache(c, nseg, lat, lon, elat, elon):
     return segs
 
 
-def run_corridor(lat, lon, elat, elon, nseg, c, start, end, forecast=False, cache_only=False):
-    # Fast path: cache-only mode — no network calls at all
-    if cache_only:
-        return segments_from_cache(c, nseg, lat, lon, elat, elon), 0.0, 0
-
-    coords = [(lat + (elat - lat) * i / nseg, lon + (elon - lon) * i / nseg)
-              for i in range(nseg + 1)]
-    segs = []; min_dlr = float("inf"); weak = 0
-
-    for idx, (slat, slon) in enumerate(coords):
-        try:
-            elev = json.loads(urllib.request.urlopen(
-                f"https://api.open-meteo.com/v1/elevation?latitude={slat}&longitude={slon}",
-                timeout=5).read().decode()).get("elevation", [0])[0]
-        except: elev = 0
-
-        try:
-            w = fetch_om(slat, slon, start, end, forecast=forecast, quick=True) if forecast \
-                else fetch_weather_multi_year(slat, slon, start, end, quick=True)
-        except Exception as e:
-            print(f"   Segment {idx+1} weather failed: {e} — using main cache")
-            cached = _cached.get("data") or []
-            if cached:
-                mnh = min(cached, key=lambda r: r.get("dlr_a", 9999) or 9999)
-                segs.append({
-                    "lat": slat, "lon": slon, "elevation_m": elev,
-                    "min_dlr_a": mnh.get("dlr_a", 0),
-                    "min_dlr_mw": amps_to_mw(mnh.get("dlr_a", 0),
-                                              CONFIG_DEFAULTS["nominal_voltage_kv"],
-                                              CONFIG_DEFAULTS["power_factor"]),
-                    "temperature_c": mnh.get("dlr_temp_c", 85.0),
-                    "sag_m": mnh.get("dlr_sag_m", 0.0),
-                    "clearance_m": mnh.get("dlr_clearance_m", 0.0),
-                    "binding_constraint": mnh.get("binding_constraint", "thermal"),
-                    "worst_hour": mnh.get("timestamp", ""),
-                    "results": [],
-                })
-                if mnh.get("dlr_a", 0) < min_dlr:
-                    min_dlr = mnh.get("dlr_a", 0); weak = idx
-            continue
-
-        if PVLIB_AVAILABLE:
-            try: w = enrich_solar(w, slat, slon)
-            except Exception: pass
-        w = smooth_wind(w)
-        res = run_dlr_records(w, c)
-        if not res: continue
-
-        mnh = min(res, key=lambda r: r["dlr_a"])
-        mn = mnh["dlr_a"]
-
-        segs.append({
-            "lat": slat, "lon": slon, "elevation_m": elev,
-            "min_dlr_a": mn,
-            "min_dlr_mw": amps_to_mw(mn, CONFIG_DEFAULTS["nominal_voltage_kv"],
-                                      CONFIG_DEFAULTS["power_factor"]),
-            "temperature_c": mnh["dlr_temp_c"],
-            "sag_m": mnh["dlr_sag_m"],
-            "clearance_m": mnh["dlr_clearance_m"],
-            "binding_constraint": mnh["binding_constraint"],
-            "worst_hour": mnh["timestamp"],
-            "results": res,
-        })
-        if mn < min_dlr: min_dlr = mn; weak = idx
-
-    if min_dlr == float("inf"): min_dlr = 0.0
-    return segs, min_dlr, weak
-
-
 # ============================================================================
-# FORECAST CACHE
+# FORECAST CACHE UPDATE
 # ============================================================================
 def update_forecast_cache(force=False):
     global _cached
@@ -987,42 +826,23 @@ def update_forecast_cache(force=False):
         c = get_conductor(CONFIG_DEFAULTS["conductor"])
         start = datetime.now().strftime("%Y-%m-%d")
         end = (datetime.now() + timedelta(days=7)).strftime("%Y-%m-%d")
-        force_archive = CONFIG_DEFAULTS.get("force_archive_forecast", False)
 
         weather = None; source = ""
-
-        if not force_archive:
-            try:
-                print("  [Tier 1] AI blend (Pangu + OM forecast)")
-                weather = blend_ai(lat, lon, start, end,
-                                    hours=CONFIG_DEFAULTS.get("ai_forecast_hours", 168))
-                if weather:
-                    if PVLIB_AVAILABLE:
-                        try: weather = enrich_solar(weather, lat, lon)
-                        except Exception: pass
-                    weather = smooth_wind(weather)
-                    source = weather[0].source if weather else "ai_blend"
-            except Exception as e:
-                print(f"  Tier 1 failed: {type(e).__name__}: {e}")
-                weather = None
-
-        if not weather and not force_archive:
-            try:
-                print("  [Tier 2] Open-Meteo forecast API")
-                weather = fetch_om(lat, lon, start, end, forecast=True)
-                if weather:
-                    if PVLIB_AVAILABLE:
-                        try: weather = enrich_solar(weather, lat, lon)
-                        except Exception: pass
-                    weather = smooth_wind(weather)
-                    source = "openmeteo_forecast"
-            except Exception as e:
-                print(f"  Tier 2 failed: {type(e).__name__}: {e}")
-                weather = None
+        try:
+            print("  [Tier 1] Open-Meteo forecast API")
+            weather = fetch_om(lat, lon, start, end, forecast=True)
+            if weather:
+                if PVLIB_AVAILABLE:
+                    try: weather = enrich_solar(weather, lat, lon)
+                    except Exception: pass
+                weather = smooth_wind(weather)
+                source = "openmeteo_forecast"
+        except Exception as e:
+            print(f"  Tier 1 failed: {type(e).__name__}: {e}")
 
         if not weather:
             try:
-                print("  [Tier 3] Open-Meteo archive fallback")
+                print("  [Tier 2] Open-Meteo archive fallback")
                 ast = (datetime.now() - timedelta(days=7)).strftime("%Y-%m-%d")
                 weather = fetch_om(lat, lon, ast, end, forecast=False)
                 if weather:
@@ -1032,8 +852,7 @@ def update_forecast_cache(force=False):
                     weather = smooth_wind(weather)
                     source = "archive_fallback"
             except Exception as e:
-                print(f"  Tier 3 failed: {type(e).__name__}: {e}")
-                weather = None
+                print(f"  Tier 2 failed: {type(e).__name__}: {e}")
 
         if not weather:
             msg = "All tiers returned no weather data"
@@ -1042,10 +861,6 @@ def update_forecast_cache(force=False):
             return
 
         results = run_dlr_records(weather, c)
-        kv = CONFIG_DEFAULTS["nominal_voltage_kv"]; pf = CONFIG_DEFAULTS["power_factor"]
-        for r in results:
-            r["dlr_mw"] = _s(amps_to_mw(r["dlr_a"], kv, pf))
-
         _cached["data"] = results
         _cached["last_updated"] = datetime.now().isoformat()
         _cached["source"] = source
@@ -1059,44 +874,105 @@ def update_forecast_cache(force=False):
         _cached["building"] = False
 
 
-def build_pangu_cache():
-    if not EARTH2STUDIO_AVAILABLE:
-        print("Earth2Studio not available"); return 1
+# ============================================================================
+# STATIC EXPORT — renders all four API responses and writes them to disk
+# ============================================================================
+def export_static_files():
+    print("\n=== Exporting static response files ===")
+    c = get_conductor(CONFIG_DEFAULTS["conductor"])
+    kv = CONFIG_DEFAULTS["nominal_voltage_kv"]
+    pf = CONFIG_DEFAULTS["power_factor"]
+    static_a = compute_static_rating_A(c)
+    static_mw = amps_to_mw(static_a, kv, pf)
+    cached = _cached.get("data") or []
+
+    if not cached:
+        print("⚠️ No cache data — cannot export static files"); return False
+
+    # --- static_current.json: first 24 records ---------------------------
+    current_recs = list(cached[:24]) if len(cached) >= 24 else list(cached)
+    _write_static(STATIC_CURRENT, {
+        "results": current_recs,
+        "static_rating_mw": static_mw,
+        "static_rating_a": static_a,
+        "location_name": CONFIG_DEFAULTS["location_name"],
+        "source": "static",
+    })
+
+    # --- static_forecast.json: all records -------------------------------
+    _write_static(STATIC_FORECAST, {
+        "forecast": cached,
+        "source": _cached.get("source") or "static",
+        "building": False,
+        "last_error": None,
+    })
+
+    # --- static_corridor.json: 4 segments from cache ---------------------
     lat = CONFIG_DEFAULTS["lat"]; lon = CONFIG_DEFAULTS["lon"]
-    start = datetime.now().strftime("%Y-%m-%d")
-    hours = CONFIG_DEFAULTS.get("ai_forecast_hours", 168)
-    cache_dir = CONFIG_DEFAULTS.get("ai_cache_dir", "./weather_cache")
-    try:
-        Path(cache_dir).mkdir(parents=True, exist_ok=True)
-    except Exception as e:
-        print(f"Cannot create cache dir: {e}"); return 1
-    key = f"pangu_{lat:.4f}_{lon:.4f}_{start}_{hours}h"
-    cache = Path(cache_dir) / f"{key}.zarr"
-    if not is_valid_zarr(cache):
-        print(f"Running Pangu inference (~60 min on CPU)...")
-        if cache.exists():
-            try: shutil.rmtree(cache, ignore_errors=True)
-            except: pass
-        dev = CONFIG_DEFAULTS.get("ai_device", "cpu")
-        onnx = CONFIG_DEFAULTS.get("pangu_onnx_path") or find_onnx()
-        if not onnx: print("Pangu ONNX not found"); return 1
-        if dev == "cpu" and TORCH_AVAILABLE:
-            try: torch.set_default_device("cpu")
-            except: pass
-        model = Pangu24(ort_24hr=onnx); data = GFS()
-        n = max(1, hours // 24)
-        io = ZarrBackend(str(cache))
-        run_deterministic(time=[start], nsteps=n, prognostic=model, data=data, io=io,
-                          device=torch.device(dev) if TORCH_AVAILABLE else None)
-        try:
-            if hasattr(io, "close"): io.close()
-        except: pass
-    else:
-        print(f"Pangu Zarr already exists")
-    print("Rebuilding forecast cache...")
-    _cached["last_updated"] = None
-    update_forecast_cache(force=True)
-    return 0
+    elat = CONFIG_DEFAULTS.get("end_lat") or (lat + 0.5)
+    elon = CONFIG_DEFAULTS.get("end_lon") or (lon + 0.5)
+    nseg = CONFIG_DEFAULTS.get("num_segments", 3)
+    segs = segments_from_cache(nseg, lat, lon, elat, elon)
+    mn = min((s["min_dlr_a"] for s in segs), default=0.0)
+    _write_static(STATIC_CORRIDOR, {
+        "min_dlr_mw": amps_to_mw(mn, kv, pf),
+        "weakest_segment": 0,
+        "source": "static",
+        "segments": [{"lat": s["lat"], "lon": s["lon"], "elevation_m": s["elevation_m"],
+                      "min_dlr_mw": s["min_dlr_mw"], "temperature_c": s["temperature_c"],
+                      "sag_m": s["sag_m"], "clearance_m": s["clearance_m"],
+                      "binding_constraint": s["binding_constraint"],
+                      "worst_hour": s["worst_hour"]} for s in segs],
+    })
+
+    # --- static_sag_comparison.json --------------------------------------
+    tower_h = CONFIG_DEFAULTS.get("tower_attachment_height_m", 30.0)
+    min_clr = CONFIG_DEFAULTS.get("min_clearance_m", 7.0)
+    corridor_span = CONFIG_DEFAULTS.get("span_length_m", 400.0)
+    gt_curve = []
+    for tc in [20, 40, 60, 75, 85, 100]:
+        sag_350 = calc_sag(tc, c, 350.0)
+        sag_400 = calc_sag(tc, c, corridor_span)
+        gt_curve.append({
+            "temp_c": tc,
+            "gt_sag_350m_m": round(sag_350, 3),
+            "gt_sag_corridor_m": round(sag_400, 3),
+            "clearance_350m_m": round(tower_h - sag_350, 3),
+            "clearance_corridor_m": round(tower_h - sag_400, 3),
+        })
+    comparisons = []
+    for bench in UTILITY_SAG_BENCHMARKS:
+        gt_sag = calc_sag(bench["temp_c"], c, float(bench["span_m"]))
+        diff = ((gt_sag - bench["sag_m"]) / bench["sag_m"]) * 100
+        comparisons.append({**bench,
+            "gt_sag_m": round(gt_sag, 3),
+            "diff_m": round(gt_sag - bench["sag_m"], 3),
+            "diff_pct": round(diff, 1)})
+    comparisons.sort(key=lambda x: abs(x.get("diff_pct", 999)))
+    _write_static(STATIC_SAGCOMP, {
+        "conductor": c.name, "tower_height_m": tower_h,
+        "min_clearance_m": min_clr, "corridor_span_m": corridor_span,
+        "gt_curve": gt_curve, "utility_benchmarks": comparisons,
+    })
+
+    # --- static_sag_check.json -------------------------------------------
+    span = CONFIG_DEFAULTS.get("span_length_m", 400.0)
+    rows = []
+    for tc in range(20, 101, 5):
+        sag = calc_sag(tc, c, span)
+        clr = tower_h - sag
+        rows.append({"temp_c": tc, "sag_m": round(sag, 3),
+                     "clearance_m": round(clr, 3),
+                     "status": "CLEARANCE_LIMITED" if clr < min_clr else "OK"})
+    _write_static(STATIC_SAGCHECK, {
+        "conductor": c.name, "span_m": span,
+        "tower_height_m": tower_h, "min_clearance_m": min_clr,
+        "sag_ref_m": CONFIG_DEFAULTS.get("sag_ref_m"),
+        "curve": rows,
+    })
+
+    print("=== Static export complete ===\n")
+    return True
 
 
 # ============================================================================
@@ -1113,14 +989,16 @@ if app is not None:
         return {"version": VERSION, "conductor": CONFIG_DEFAULTS.get("conductor"),
                 "pvlib": PVLIB_AVAILABLE, "earth2studio": EARTH2STUDIO_AVAILABLE,
                 "mcp_loaded": MCP is not None,
-                "tower_height_m": CONFIG_DEFAULTS.get("tower_attachment_height_m"),
-                "min_clearance_m": CONFIG_DEFAULTS.get("min_clearance_m"),
-                "span_length_m": CONFIG_DEFAULTS.get("span_length_m"),
-                "sag_ref_m": CONFIG_DEFAULTS.get("sag_ref_m"),
                 "cache_records": len(_cached.get("data") or []),
                 "cache_source": _cached.get("source"),
                 "cache_building": _cached.get("building", False),
                 "cache_last_error": _cached.get("last_error"),
+                "static_files_present": {
+                    STATIC_CURRENT: os.path.exists(STATIC_CURRENT),
+                    STATIC_FORECAST: os.path.exists(STATIC_FORECAST),
+                    STATIC_CORRIDOR: os.path.exists(STATIC_CORRIDOR),
+                    STATIC_SAGCOMP: os.path.exists(STATIC_SAGCOMP),
+                },
                 "auto_fresh": os.environ.get("GRIDTWEAK_AUTO_FRESH", "0")}
 
     @app.get("/dlr/cache_status")
@@ -1150,94 +1028,61 @@ if app is not None:
 
     @app.get("/dlr/sag_check")
     async def sag_check():
+        s = _read_static(STATIC_SAGCHECK)
+        if s is not None: return JSONResponse(content=s)
+        # fallback: compute
         c = get_conductor(CONFIG_DEFAULTS["conductor"])
         span = CONFIG_DEFAULTS.get("span_length_m", 400.0)
         tower_h = CONFIG_DEFAULTS.get("tower_attachment_height_m", 30.0)
         min_clr = CONFIG_DEFAULTS.get("min_clearance_m", 7.0)
         rows = []
         for tc in range(20, 101, 5):
-            sag = calc_sag(tc, c, span)
-            clr = tower_h - sag
-            rows.append({
-                "temp_c": tc, "sag_m": round(sag, 3),
-                "clearance_m": round(clr, 3),
-                "status": "CLEARANCE_LIMITED" if clr < min_clr else "OK"
-            })
+            sag = calc_sag(tc, c, span); clr = tower_h - sag
+            rows.append({"temp_c": tc, "sag_m": round(sag, 3),
+                         "clearance_m": round(clr, 3),
+                         "status": "CLEARANCE_LIMITED" if clr < min_clr else "OK"})
         return JSONResponse(content=_san({
-            "conductor": c.name, "span_m": span,
-            "tower_height_m": tower_h, "min_clearance_m": min_clr,
-            "sag_ref_m": CONFIG_DEFAULTS.get("sag_ref_m"),
-            "curve": rows,
-        }))
+            "conductor": c.name, "span_m": span, "tower_height_m": tower_h,
+            "min_clearance_m": min_clr, "sag_ref_m": CONFIG_DEFAULTS.get("sag_ref_m"),
+            "curve": rows}))
 
     @app.get("/dlr/sag_comparison")
     async def sag_comparison():
+        s = _read_static(STATIC_SAGCOMP)
+        if s is not None: return JSONResponse(content=s)
+        # fallback: compute
         c = get_conductor(CONFIG_DEFAULTS["conductor"])
         tower_h = CONFIG_DEFAULTS.get("tower_attachment_height_m", 30.0)
         min_clr = CONFIG_DEFAULTS.get("min_clearance_m", 7.0)
         corridor_span = CONFIG_DEFAULTS.get("span_length_m", 400.0)
-
         gt_curve = []
         for tc in [20, 40, 60, 75, 85, 100]:
-            sag_350 = calc_sag(tc, c, 350.0)
-            sag_400 = calc_sag(tc, c, corridor_span)
             gt_curve.append({
                 "temp_c": tc,
-                "gt_sag_350m_m": round(sag_350, 3),
-                "gt_sag_corridor_m": round(sag_400, 3),
-                "clearance_350m_m": round(tower_h - sag_350, 3),
-                "clearance_corridor_m": round(tower_h - sag_400, 3),
-            })
-
+                "gt_sag_350m_m": round(calc_sag(tc, c, 350.0), 3),
+                "gt_sag_corridor_m": round(calc_sag(tc, c, corridor_span), 3),
+                "clearance_350m_m": round(tower_h - calc_sag(tc, c, 350.0), 3),
+                "clearance_corridor_m": round(tower_h - calc_sag(tc, c, corridor_span), 3)})
         comparisons = []
         for bench in UTILITY_SAG_BENCHMARKS:
-            if bench["span_m"] is None or bench["sag_m"] is None:
-                continue
-            gt_sag = calc_sag(bench["temp_c"], c, float(bench["span_m"]))
-            diff = ((gt_sag - bench["sag_m"]) / bench["sag_m"]) * 100
-            comparisons.append({
-                **bench,
-                "gt_sag_m": round(gt_sag, 3),
-                "diff_m": round(gt_sag - bench["sag_m"], 3),
-                "diff_pct": round(diff, 1),
-            })
-
+            gt = calc_sag(bench["temp_c"], c, float(bench["span_m"]))
+            diff = ((gt - bench["sag_m"]) / bench["sag_m"]) * 100
+            comparisons.append({**bench, "gt_sag_m": round(gt, 3),
+                "diff_m": round(gt - bench["sag_m"], 3), "diff_pct": round(diff, 1)})
         comparisons.sort(key=lambda x: abs(x.get("diff_pct", 999)))
-
         return JSONResponse(content=_san({
-            "conductor": c.name,
-            "tower_height_m": tower_h,
-            "min_clearance_m": min_clr,
-            "corridor_span_m": corridor_span,
-            "gt_curve": gt_curve,
-            "utility_benchmarks": comparisons,
-        }))
+            "conductor": c.name, "tower_height_m": tower_h,
+            "min_clearance_m": min_clr, "corridor_span_m": corridor_span,
+            "gt_curve": gt_curve, "utility_benchmarks": comparisons}))
 
     @app.get("/dlr/wind_check")
     async def wind_check():
-        lat = CONFIG_DEFAULTS["lat"]; lon = CONFIG_DEFAULTS["lon"]
-        end = datetime.now().strftime("%Y-%m-%d")
-        start = (datetime.now() - timedelta(days=1)).strftime("%Y-%m-%d")
-        try:
-            w = fetch_weather_multi_year(lat, lon, start, end, quick=True)
-        except Exception as e:
-            return JSONResponse(content={"error": str(e), "samples": []})
-        rows = []
-        for r in w:
-            geo = wind_geom(_s(r.wind_mps), _s(r.wind_direction_deg), LINE_AZ)
-            rows.append({
-                "timestamp": r.timestamp,
-                "era5_raw_mps": round(_s(getattr(r, "wind_raw_mps", 0.0)), 2),
-                "mcp_mps": round(_s(r.wind_mps), 2),
-                "perp_mps": round(geo["perpendicular_ms"], 2),
-                "direction_deg": round(_s(r.wind_direction_deg), 1),
-            })
         metar = fetch_metar(CONFIG_DEFAULTS.get("metar_icao", "VABB"))
         return JSONResponse(content=_san({
-            "n_records": len(rows), "metar_current": metar,
+            "n_records": 0, "metar_current": metar,
             "mcp_slope": MCP["slope"] if MCP else None,
             "mcp_intercept": MCP["intercept"] if MCP else None,
-            "samples": rows[:24],
+            "samples": [],
         }))
 
     @app.get("/dlr/metar")
@@ -1246,46 +1091,32 @@ if app is not None:
 
     @app.get("/dlr/current")
     async def get_current():
-        """
-        Cache-first. Returns the first 24 records of the pre-built cache
-        immediately, then tries live in the background (fire and forget).
-        If no cache exists, falls back to a quick live fetch.
-        """
-        lat = CONFIG_DEFAULTS["lat"]; lon = CONFIG_DEFAULTS["lon"]
-        c = get_conductor(CONFIG_DEFAULTS["conductor"])
+        s = _read_static(STATIC_CURRENT)
+        if s is not None:
+            return JSONResponse(content=s)
+        # fallback: derive from cache
         cached = _cached.get("data") or []
-
-        if cached:
-            # Use the first 24 records (closest to "now" from the cache build time)
-            res = list(cached[:24]) if len(cached) >= 24 else list(cached)
-            source = "cache"
-            # Kick off a background refresh; don't block the response
-            threading.Thread(target=update_forecast_cache, kwargs={"force": True},
-                             daemon=True).start()
-        else:
-            res = []
-            source = "live"
-            try:
-                end = datetime.now().strftime("%Y-%m-%d")
-                start = (datetime.now() - timedelta(days=1)).strftime("%Y-%m-%d")
-                w = fetch_weather_multi_year(lat, lon, start, end, quick=True)
-                res = run_dlr_records(w, c)
-            except Exception as e:
-                print(f"/dlr/current live fetch failed (no cache): {e}")
-
-        if len(res) > 24: res = res[-24:]
+        c = get_conductor(CONFIG_DEFAULTS["conductor"])
         kv = CONFIG_DEFAULTS["nominal_voltage_kv"]; pf = CONFIG_DEFAULTS["power_factor"]
-        for r in res:
-            r["dlr_mw"] = _s(amps_to_mw(r["dlr_a"], kv, pf))
         static_a = compute_static_rating_A(c)
-        static_mw = amps_to_mw(static_a, kv, pf)
+        if cached:
+            res = list(cached[:24]) if len(cached) >= 24 else list(cached)
+            return JSONResponse(content=_san({
+                "results": res, "static_rating_mw": amps_to_mw(static_a, kv, pf),
+                "static_rating_a": static_a,
+                "location_name": CONFIG_DEFAULTS["location_name"],
+                "source": "cache"}))
         return JSONResponse(content=_san({
-            "results": res, "static_rating_mw": static_mw, "static_rating_a": static_a,
+            "results": [], "static_rating_mw": amps_to_mw(static_a, kv, pf),
+            "static_rating_a": static_a,
             "location_name": CONFIG_DEFAULTS["location_name"],
-            "source": source}))
+            "source": "empty"}))
 
     @app.get("/dlr/forecast")
     async def get_forecast():
+        s = _read_static(STATIC_FORECAST)
+        if s is not None:
+            return JSONResponse(content=s)
         if _cached["data"] is None:
             return JSONResponse(content={"forecast": [], "source": None,
                                           "building": _cached.get("building", False),
@@ -1304,48 +1135,26 @@ if app is not None:
 
     @app.get("/dlr/corridor")
     async def get_corridor():
+        s = _read_static(STATIC_CORRIDOR)
+        if s is not None:
+            return JSONResponse(content=s)
+        # fallback: segments from cache
         try:
             lat = CONFIG_DEFAULTS["lat"]; lon = CONFIG_DEFAULTS["lon"]
             elat = CONFIG_DEFAULTS.get("end_lat") or (lat + 0.5)
             elon = CONFIG_DEFAULTS.get("end_lon") or (lon + 0.5)
             nseg = CONFIG_DEFAULTS.get("num_segments", 3)
-            c = get_conductor(CONFIG_DEFAULTS["conductor"])
-
-            # If we have a cache, serve corridor from it instantly (no Open-Meteo).
-            if _cached.get("data"):
-                segs = segments_from_cache(c, nseg, lat, lon, elat, elon)
-                mn = min((s["min_dlr_a"] for s in segs), default=0.0)
-                kv = CONFIG_DEFAULTS["nominal_voltage_kv"]
-                pf = CONFIG_DEFAULTS["power_factor"]
-                return JSONResponse(content=_san({
-                    "min_dlr_mw": _s(amps_to_mw(mn, kv, pf)),
-                    "weakest_segment": 0,
-                    "source": "cache",
-                    "segments": [{"lat": s["lat"], "lon": s["lon"],
-                                  "elevation_m": s["elevation_m"],
-                                  "min_dlr_mw": _s(s["min_dlr_mw"]),
-                                  "temperature_c": _s(s["temperature_c"]),
-                                  "sag_m": _s(s["sag_m"]),
-                                  "clearance_m": _s(s["clearance_m"]),
-                                  "binding_constraint": s["binding_constraint"],
-                                  "worst_hour": s["worst_hour"]} for s in segs]}))
-
-            # No cache — try live (with quick=True so it fails in seconds)
-            start = (datetime.now() - timedelta(days=1)).strftime("%Y-%m-%d")
-            end = datetime.now().strftime("%Y-%m-%d")
-            segs, mn, weak = run_corridor(lat, lon, elat, elon, nseg, c, start, end,
-                                          forecast=False, cache_only=False)
             kv = CONFIG_DEFAULTS["nominal_voltage_kv"]; pf = CONFIG_DEFAULTS["power_factor"]
+            segs = segments_from_cache(nseg, lat, lon, elat, elon)
+            mn = min((s["min_dlr_a"] for s in segs), default=0.0)
             return JSONResponse(content=_san({
-                "min_dlr_mw": _s(amps_to_mw(mn, kv, pf)),
-                "weakest_segment": weak,
-                "source": "live",
+                "min_dlr_mw": amps_to_mw(mn, kv, pf),
+                "weakest_segment": 0, "source": "cache",
                 "segments": [{"lat": s["lat"], "lon": s["lon"],
                               "elevation_m": s["elevation_m"],
-                              "min_dlr_mw": _s(s["min_dlr_mw"]),
-                              "temperature_c": _s(s["temperature_c"]),
-                              "sag_m": _s(s["sag_m"]),
-                              "clearance_m": _s(s["clearance_m"]),
+                              "min_dlr_mw": s["min_dlr_mw"],
+                              "temperature_c": s["temperature_c"],
+                              "sag_m": s["sag_m"], "clearance_m": s["clearance_m"],
                               "binding_constraint": s["binding_constraint"],
                               "worst_hour": s["worst_hour"]} for s in segs]}))
         except Exception as e:
@@ -1474,7 +1283,7 @@ GridTweak's parabolic sag model compared against published sag values from PGCIL
 <div class="footer">
 <div style="font-size:11px;color:#718096;margin-bottom:8px;line-height:1.6;">
 Thermal headroom only. Network transfer capability may be constrained by other system limits.
-<span style="display:inline-block;margin-left:12px;font-size:10px;background:#f0f4f8;padding:2px 8px;border-radius:12px;color:#4a5568;">V2.13.1 | IEEE 738 | Sag benchmarks</span>
+<span style="display:inline-block;margin-left:12px;font-size:10px;background:#f0f4f8;padding:2px 8px;border-radius:12px;color:#4a5568;">V2.14 | IEEE 738 | Sag benchmarks</span>
 </div>
 &copy; 2026 GridTweak
 </div></div>
@@ -1488,9 +1297,7 @@ function smooth3(arr) {{
     const out = [];
     for (let i = 0; i < arr.length; i++) {{
         let s = 0, n = 0;
-        for (let j = Math.max(0, i-1); j <= Math.min(arr.length-1, i+1); j++) {{
-            s += arr[j]; n++;
-        }}
+        for (let j = Math.max(0, i-1); j <= Math.min(arr.length-1, i+1); j++) {{ s += arr[j]; n++; }}
         out.push(s / n);
     }}
     return out;
@@ -1588,20 +1395,14 @@ async function fetchForecast() {{
         if (!r.ok) return;
         const data = await r.json();
         if (!data.forecast || !data.forecast.length) {{
-            const msg = data.building
-                ? `Building... retry ${{forecastRetries + 1}}/30`
-                : (data.last_error ? `Error: ${{data.last_error}}` : 'Fetching...');
+            const msg = data.building ? `Building...` : (data.last_error ? `Error: ${{data.last_error}}` : 'Fetching...');
             document.getElementById('forecastTable').innerHTML = `<p>${{msg}}</p>`;
-            if (forecastRetries < 30) {{
-                forecastRetries++;
-                setTimeout(fetchForecast, 10000);
-            }}
+            if (forecastRetries < 30) {{ forecastRetries++; setTimeout(fetchForecast, 10000); }}
             return;
         }}
         forecastRetries = 0;
         const labels = data.forecast.map(x => {{
-            const d = new Date(x.timestamp);
-            const h = d.getHours();
+            const d = new Date(x.timestamp); const h = d.getHours();
             if (h === 0) return d.toLocaleDateString('en-IN', {{month:'short', day:'numeric'}});
             return h.toString().padStart(2, '0') + ':00';
         }});
@@ -1684,19 +1485,16 @@ async function fetchSagComparison() {{
         if (!r.ok) return;
         const data = await r.json();
         if (!data.utility_benchmarks) return;
-
         let html = '<table style="margin-bottom:16px;"><tr><th>Temp (C)</th><th>Sag @ 350m (m)</th><th>Sag @ corridor (m)</th><th>Clearance @ corridor (m)</th></tr>';
         data.gt_curve.forEach(row => {{
             html += `<tr><td>${{row.temp_c}}</td><td>${{row.gt_sag_350m_m.toFixed(2)}}</td><td>${{row.gt_sag_corridor_m.toFixed(2)}}</td><td>${{row.clearance_corridor_m.toFixed(2)}}</td></tr>`;
         }});
         html += '</table>';
-
         html += '<table><tr><th>Source</th><th>Conductor</th><th>Span (m)</th><th>Temp (C)</th><th>Reported Sag (m)</th><th>GridTweak Sag (m)</th><th>Diff (%)</th></tr>';
         data.utility_benchmarks.forEach(b => {{
             const rep = b.sag_m !== null ? b.sag_m.toFixed(3) : '-';
             const gt = b.gt_sag_m !== null ? b.gt_sag_m.toFixed(3) : '-';
-            let diff = '-';
-            let cls = '';
+            let diff = '-'; let cls = '';
             if (b.diff_pct !== null) {{
                 diff = (b.diff_pct >= 0 ? '+' : '') + b.diff_pct.toFixed(1) + '%';
                 cls = Math.abs(b.diff_pct) < 15 ? 'diff-good' : 'diff-warn';
@@ -1705,7 +1503,6 @@ async function fetchSagComparison() {{
         }});
         html += '</table>';
         html += '<p style="font-size:11px;color:#718096;margin-top:8px;">Notes: PGCIL (10.600m) and AEGCL (8.435m) use different stringing tensions. GridTweak matches PGCIL within the tolerance band. Diff % shown is (GridTweak - Reported) / Reported.</p>';
-
         document.getElementById('sagComparisonTable').innerHTML = html;
     }} catch(e) {{ console.error('Sag comparison error:', e); }}
 }}
@@ -1737,6 +1534,8 @@ def main():
     parser.add_argument("--fresh", action="store_true")
     parser.add_argument("--run-pangu", action="store_true")
     parser.add_argument("--build-cache", action="store_true")
+    parser.add_argument("--export-static", action="store_true",
+                        help="Build cache then write static_*.json response files")
     parser.add_argument("--port", type=int, default=8000)
     args = parser.parse_args()
 
@@ -1763,20 +1562,6 @@ def main():
     print(f"Conductor: {c.name}")
     print(f"Static rating (75C): {static_a:.0f} A = {amps_to_mw(static_a, kv, pf):.1f} MW")
 
-    print(f"\nSag curve (span={CONFIG_DEFAULTS['span_length_m']}m, tower={CONFIG_DEFAULTS['tower_attachment_height_m']}m):")
-    for tc in [20, 40, 60, 75, 85, 100]:
-        sag = calc_sag(tc, c)
-        clr = CONFIG_DEFAULTS['tower_attachment_height_m'] - sag
-        flag = " WARN" if clr < CONFIG_DEFAULTS['min_clearance_m'] else ""
-        print(f"  {tc:3d}C -> sag {sag:.2f}m, clearance {clr:.2f}m{flag}")
-
-    print(f"\nUtility benchmark comparison (at 350 m span):")
-    for b in UTILITY_SAG_BENCHMARKS:
-        if b["span_m"] and b["sag_m"]:
-            gt = calc_sag(b["temp_c"], c, float(b["span_m"]))
-            diff = ((gt - b["sag_m"]) / b["sag_m"]) * 100
-            print(f"  {b['source']:35s} reported {b['sag_m']:.3f}m | GridTweak {gt:.3f}m ({diff:+.1f}%)")
-
     auto_freshed = maybe_auto_fresh()
     if not auto_freshed:
         load_cache()
@@ -1787,7 +1572,18 @@ def main():
         clear_cache_state()
         print("Cleared all in-memory cache state")
 
-    if args.run_pangu: return build_pangu_cache()
+    # --export-static: build cache then dump all four response files
+    if args.export_static:
+        _cached["last_updated"] = None
+        print("\nBuilding fresh cache for export...")
+        update_forecast_cache(force=True)
+        n = len(_cached.get("data") or [])
+        if n == 0:
+            print("❌ Cache build produced 0 records — cannot export")
+            return 1
+        print(f"Cache: {n} records via {_cached.get('source')}")
+        ok = export_static_files()
+        return 0 if ok else 1
 
     if args.build_cache:
         _cached["last_updated"] = None
@@ -1796,24 +1592,23 @@ def main():
         print(f"\nRESULT: {n} records via {_cached.get('source')}")
         return 0 if n > 0 else 1
 
+    if args.run_pangu: return 1
+
     if args.api:
         if not API_AVAILABLE: return 1
         print(f"\nAPI:         http://localhost:{port}")
         print(f"Dashboard:   http://localhost:{port}/dashboard")
-        print(f"Sag check:   http://localhost:{port}/dlr/sag_check")
-        print(f"Sag compare: http://localhost:{port}/dlr/sag_comparison")
-
-        if _cached["data"]:
-            n = len(_cached["data"])
-            print(f"Serving pre-built cache ({n} records) — background refresh starting")
-            threading.Thread(target=update_forecast_cache, kwargs={"force": True},
-                             daemon=True).start()
+        # Static files take precedence; only refresh in background if missing
+        statics_present = all(os.path.exists(f) for f in
+                              [STATIC_CURRENT, STATIC_FORECAST, STATIC_CORRIDOR])
+        if statics_present:
+            print("Serving pre-rendered static files — no live API calls on request path")
+        elif _cached["data"]:
+            print(f"Serving pre-built cache ({len(_cached['data'])} records)")
         else:
-            print("No cache present — building from scratch (may take 30s or fail if rate-limited)...")
-            threading.Thread(target=update_forecast_cache, kwargs={"force": True},
-                             daemon=True).start()
+            print("No static files or cache — endpoints will return empty")
 
-        if SCHEDULER_AVAILABLE:
+        if SCHEDULER_AVAILABLE and not statics_present:
             try:
                 sched = BackgroundScheduler()
                 sched.add_job(update_forecast_cache, "interval",

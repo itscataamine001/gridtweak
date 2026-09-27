@@ -7,7 +7,6 @@ venv/
 env/
 
 # --- Runtime caches / data ---
-forecast_cache.json
 dlr_data.db
 mcp_calibration.json
 weather_cache/
