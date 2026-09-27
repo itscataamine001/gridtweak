@@ -1,0 +1,20 @@
+﻿# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.pytest_cache/
+
+# GridTweak ephemeral / local-only
+forecast_cache.json
+forecast.json
+dlr_data.db
+config.json
+weather_cache/
+wunderground_data/
+*.log
+
+# OS
+.DS_Store
+Thumbs.db

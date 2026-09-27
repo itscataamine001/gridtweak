@@ -1,0 +1,34 @@
+{
+  "n_samples": 1440,
+  "slope": 1.3622246506491102,
+  "intercept": 0.694762379395824,
+  "slope_sigma": 0.025214124861868355,
+  "intercept_sigma": 0.05401428513684555,
+  "residual_sigma_ms": 1.274417007408027,
+  "rmse_ms": 1.296634359917571,
+  "r_squared": 0.5096242474309609,
+  "ols_slope": 0.972213553876652,
+  "ols_intercept": 1.7487421386285473,
+  "x_mean": 3.3212638888888892,
+  "y_mean": 4.9777199074074066,
+  "x_std": 1.458343642754565,
+  "y_std": 1.8192660526752134,
+  "x_range": [
+    0.05,
+    7.04
+  ],
+  "y_range": [
+    0.0,
+    10.0
+  ],
+  "calibration_date": "2026-09-26T23:40:41.055097",
+  "date_range": [
+    "2026-07-28",
+    "2026-09-25"
+  ],
+  "source_reference": "ERA5 10m wind (Open-Meteo archive API)",
+  "source_target": "Wunderground Mumbai station",
+  "methodology": "TLS/ODR, errors-in-variables",
+  "lat": 19.076,
+  "lon": 72.877
+}

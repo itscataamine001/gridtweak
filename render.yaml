@@ -1,12 +1,16 @@
-
-services:
+﻿services:
   - type: web
     name: gridtweak
     runtime: python
     plan: free
-    buildCommand: pip install -r requirements.txt
-    startCommand: python dlr_v28.py --api --config config.json --port $PORT
-    healthCheckPath: /
+    region: singapore
+    branch: main
+    autoDeploy: true
+    buildCommand: pip install --upgrade pip && pip install -r requirements.txt
+    startCommand: python dlr_v2.8.py --api
+    healthCheckPath: /dlr/health
     envVars:
-      - key: PYTHONUNBUFFERED
-        value: 1
+      - key: GRIDTWEAK_AUTO_FRESH
+        value: "1"
+      - key: PYTHON_VERSION
+        value: "3.10.13"
