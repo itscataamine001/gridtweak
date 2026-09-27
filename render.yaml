@@ -1,16 +1,17 @@
 ﻿services:
   - type: web
-    name: gridtweak
+    name: gridtweak-dlr
     runtime: python
-    plan: free
-    region: singapore
-    branch: main
-    autoDeploy: true
-    buildCommand: pip install --upgrade pip && pip install -r requirements.txt
-    startCommand: python dlr_v2.8.py --api
+    plan: free  # Change to 'starter' later if you need a persistent disk
+    buildCommand: pip install -r requirements.txt
+    startCommand: python dlr_v2.8.py --api --port $PORT
     healthCheckPath: /dlr/health
     envVars:
-      - key: GRIDTWEAK_AUTO_FRESH
-        value: "1"
       - key: PYTHON_VERSION
-        value: "3.10.13"
+        value: 3.10.0
+      - key: PYTHONIOENCODING
+        value: utf-8  # Crucial: Prevents the emoji encoding crash on Render
+      - key: GRIDTWEAK_AUTO_FRESH
+        value: "1"    # Forces a fresh cache build on every deploy
+      - key: TZ
+        value: Asia/Kolkata
