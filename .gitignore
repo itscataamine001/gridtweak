@@ -7,7 +7,6 @@ venv/
 .pytest_cache/
 
 # GridTweak ephemeral / local-only
-forecast_cache.json
 forecast.json
 dlr_data.db
 config.json
