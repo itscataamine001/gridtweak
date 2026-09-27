@@ -1,9 +1,8 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-GridTweak DLR Engine - V2.12
-V2.11 + removed standalone "Advisory" badge + Render-ready startup
-(GRIDTWEAK_AUTO_FRESH env var, $PORT support, writable-dir safety).
+GridTweak DLR Engine - V2.12.1
+V2.12 + reduced API polling + Open-Meteo 429 backoff.
 """
 
 import argparse, json, math, sys, os, shutil, warnings, time, threading, traceback, re
@@ -178,7 +177,6 @@ CACHE_FILE = "forecast_cache.json"
 DB_FILE = "dlr_data.db"
 
 def _ensure_writable_dir(path_str):
-    """Create parent dirs if needed (safe on read-only FS — silently continues)."""
     try:
         p = Path(path_str).parent
         if str(p) and str(p) != ".":
@@ -222,14 +220,6 @@ def clear_cache_state():
 
 
 def maybe_auto_fresh():
-    """
-    Render/cloud helper: if GRIDTWEAK_AUTO_FRESH is truthy, delete the
-    ephemeral forecast cache and DLR DB on startup so a fresh build
-    always happens automatically — no manual --fresh flag needed.
-
-    NOTE: weather_cache/*.zarr (60-min Pangu inference) is intentionally
-    NOT touched. Only the fast-to-rebuild JSON cache is wiped.
-    """
     val = os.environ.get("GRIDTWEAK_AUTO_FRESH", "").strip().lower()
     if val not in ("1", "true", "yes", "on"):
         return False
@@ -248,7 +238,7 @@ def maybe_auto_fresh():
 # ============================================================================
 # CONFIG
 # ============================================================================
-VERSION = "V2.12"
+VERSION = "V2.12.1"
 APP_NAME = "GridTweak"
 
 CONFIG_DEFAULTS = {
@@ -650,8 +640,7 @@ def fetch_om(lat, lon, start, end, tz="auto", forecast=False):
       - forecast=True: /v1/forecast with forecast_days=7.
       - forecast=False and end <= now-5d: archive API (fully historical).
       - forecast=False and end > now-5d: /v1/forecast with past_days + forecast_days,
-        then filter client-side to [start, end]. This avoids the archive API's
-        400 Bad Request for recent dates.
+        then filter client-side to [start, end].
     """
     try:
         start_dt = datetime.fromisoformat(start) if "T" in start \
@@ -705,6 +694,16 @@ def fetch_om(lat, lon, start, end, tz="auto", forecast=False):
         except Exception as e:
             last_err = e
             code = getattr(e, "code", None)
+            # 429 = rate limit. Back off hard, retry a few times.
+            if code == 429:
+                if att < 3:
+                    delay = 30 * (att + 1)
+                    print(f"      429 rate-limited — waiting {delay}s")
+                    time.sleep(delay)
+                    continue
+                print("      429 persisted — giving up")
+                break
+            # Other 4xx = client error, don't retry
             if code is not None and 400 <= code < 500:
                 print(f"      HTTP {code} (no retry)")
                 break
@@ -904,8 +903,13 @@ def run_corridor(lat, lon, elat, elon, nseg, c, start, end, forecast=False):
                 timeout=10).read().decode()).get("elevation", [0])[0]
         except: elev = 0
 
-        w = fetch_om(slat, slon, start, end, forecast=forecast) if forecast \
-            else fetch_weather_multi_year(slat, slon, start, end)
+        try:
+            w = fetch_om(slat, slon, start, end, forecast=forecast) if forecast \
+                else fetch_weather_multi_year(slat, slon, start, end)
+        except Exception as e:
+            print(f"   Segment {idx+1} weather failed: {e}")
+            continue
+
         if PVLIB_AVAILABLE:
             try: w = enrich_solar(w, slat, slon)
             except Exception: pass
@@ -1189,7 +1193,10 @@ if app is not None:
         lat = CONFIG_DEFAULTS["lat"]; lon = CONFIG_DEFAULTS["lon"]
         end = datetime.now().strftime("%Y-%m-%d")
         start = (datetime.now() - timedelta(days=1)).strftime("%Y-%m-%d")
-        w = fetch_weather_multi_year(lat, lon, start, end)
+        try:
+            w = fetch_weather_multi_year(lat, lon, start, end)
+        except Exception as e:
+            return JSONResponse(content={"error": str(e), "samples": []})
         rows = []
         for r in w:
             geo = wind_geom(_s(r.wind_mps), _s(r.wind_direction_deg), LINE_AZ)
@@ -1218,7 +1225,17 @@ if app is not None:
         c = get_conductor(CONFIG_DEFAULTS["conductor"])
         end = datetime.now().strftime("%Y-%m-%d")
         start = (datetime.now() - timedelta(days=1)).strftime("%Y-%m-%d")
-        w = fetch_weather_multi_year(lat, lon, start, end)
+        try:
+            w = fetch_weather_multi_year(lat, lon, start, end)
+        except Exception as e:
+            print(f"/dlr/current weather fetch failed: {e}")
+            static_a = compute_static_rating_A(c)
+            kv = CONFIG_DEFAULTS["nominal_voltage_kv"]; pf = CONFIG_DEFAULTS["power_factor"]
+            return JSONResponse(content=_san({
+                "results": [], "static_rating_mw": amps_to_mw(static_a, kv, pf),
+                "static_rating_a": static_a,
+                "location_name": CONFIG_DEFAULTS["location_name"],
+                "error": str(e)}))
         res = run_dlr_records(w, c)
         if len(res) > 24: res = res[-24:]
         kv = CONFIG_DEFAULTS["nominal_voltage_kv"]; pf = CONFIG_DEFAULTS["power_factor"]
@@ -1397,7 +1414,7 @@ GridTweak's parabolic sag model compared against published sag values from PGCIL
 <div class="footer">
 <div style="font-size:11px;color:#718096;margin-bottom:8px;line-height:1.6;">
 Thermal headroom only. Network transfer capability may be constrained by other system limits.
-<span style="display:inline-block;margin-left:12px;font-size:10px;background:#f0f4f8;padding:2px 8px;border-radius:12px;color:#4a5568;">V2.12 | IEEE 738 | Sag benchmarks</span>
+<span style="display:inline-block;margin-left:12px;font-size:10px;background:#f0f4f8;padding:2px 8px;border-radius:12px;color:#4a5568;">V2.12.1 | IEEE 738 | Sag benchmarks</span>
 </div>
 &copy; 2026 GridTweak
 </div></div>
@@ -1446,7 +1463,6 @@ function initCharts() {{
 async function fetchAll() {{
     await fetchHistorical();
     await fetchForecast();
-    await fetchCorridor();
     document.getElementById('lastUpdated').textContent = 'Updated: ' + new Date().toLocaleTimeString();
 }}
 
@@ -1518,7 +1534,7 @@ async function fetchForecast() {{
             document.getElementById('forecastTable').innerHTML = `<p>${{msg}}</p>`;
             if (forecastRetries < 30) {{
                 forecastRetries++;
-                setTimeout(fetchForecast, 5000);
+                setTimeout(fetchForecast, 10000);
             }}
             return;
         }}
@@ -1645,7 +1661,7 @@ document.querySelectorAll('.tab').forEach(tab => {{
     }});
 }});
 
-initCharts(); fetchAll(); setInterval(fetchAll, 60000);
+initCharts(); fetchAll(); setInterval(fetchAll, 300000);
 </script>
 </body></html>"""
         return html
@@ -1664,7 +1680,6 @@ def main():
     parser.add_argument("--port", type=int, default=8000)
     args = parser.parse_args()
 
-    # Cloud-friendly port resolution (Render/Heroku/Fly/etc.)
     port = int(os.environ.get("PORT", args.port))
 
     if args.config:
@@ -1702,9 +1717,6 @@ def main():
             diff = ((gt - b["sag_m"]) / b["sag_m"]) * 100
             print(f"  {b['source']:35s} reported {b['sag_m']:.3f}m | GridTweak {gt:.3f}m ({diff:+.1f}%)")
 
-    # ------------------------------------------------------------------
-    # Auto-fresh before touching any cache (Render/cloud-ready)
-    # ------------------------------------------------------------------
     auto_freshed = maybe_auto_fresh()
     if not auto_freshed:
         load_cache()
@@ -1740,7 +1752,6 @@ def main():
                     need_build = False
             except: pass
 
-        # On auto-fresh we always rebuild
         if auto_freshed:
             need_build = True
 
@@ -1755,7 +1766,7 @@ def main():
                 sched.add_job(update_forecast_cache, "interval",
                               hours=CONFIG_DEFAULTS.get("scheduler_interval_hours", 6))
                 sched.start()
-                print("Forecast refreshes every 6h")
+                print(f"Forecast refreshes every {CONFIG_DEFAULTS.get('scheduler_interval_hours', 6)}h")
             except Exception as e:
                 print(f"Scheduler skipped: {e}")
 
