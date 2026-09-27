@@ -1,0 +1,24 @@
+
+{
+  "lat": 28.6139,
+  "lon": 77.2090,
+  "conductor": "panther",
+  "convection_model": "ieee738",
+  "test_current": 1000,
+  "nominal_voltage_kv": 220,
+  "power_factor": 0.9,
+  "static_rating_mw": 600,
+  "use_ml": true,
+  "num_segments": 3,
+  "span_length_m": 400,
+  "sag_ref_m": 5.0,
+  "ref_temp_sag": 20.0,
+  "alert_threshold_dlr": 2500,
+  "alert_threshold_temp": 80,
+  "email_enabled": false,
+  "slack_enabled": false,
+  "wind_max_mps": 7.0,
+  "wind_smoothing_window": 3,
+  "wind_correction_factor": 0.35,
+  "dlr_scaling_factor": 0.80
+}
