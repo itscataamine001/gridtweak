@@ -1,12 +1,10 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-GridTweak DLR Engine - V2.16
-V2.15.1 + Pangu-Weather integration restored.
-- Tier 1: blend_ai() (Open-Meteo + Pangu anomalies)
-- Tier 2: Open-Meteo forecast
-- Tier 3: Open-Meteo archive fallback
-Use --run-pangu once to build the ~60 min Zarr cache; subsequent runs load instantly.
+GridTweak DLR Engine - V2.16.1
+V2.16 + Pangu JSON export for cross-env deploy.
+- Local (laptop): full Pangu via earth2studio + Zarr cache
+- Render: reads pangu_forecast.json (small) for AI blend without earth2studio
 """
 
 import argparse, json, math, sys, os, shutil, warnings, time, threading, traceback, re
@@ -186,6 +184,8 @@ STATIC_CORRIDOR  = "static_corridor.json"
 STATIC_SAGCOMP   = "static_sag_comparison.json"
 STATIC_SAGCHECK  = "static_sag_check.json"
 
+PANGU_JSON = "pangu_forecast.json"
+
 
 def _read_static(path):
     if not os.path.exists(path): return None
@@ -267,7 +267,7 @@ def maybe_auto_fresh():
 # ============================================================================
 # CONFIG
 # ============================================================================
-VERSION = "V2.16"
+VERSION = "V2.16.1"
 APP_NAME = "GridTweak"
 
 CONFIG_DEFAULTS = {
@@ -571,7 +571,7 @@ def is_valid_zarr(p):
 
 
 def _extract_pangu_records(ds, lat, lon, start):
-    """Extract daily records for a grid point from the Pangu Zarr dataset."""
+    """Extract daily records from Pangu Zarr, and write a small JSON extract."""
     ds_pt = None
     for la, lo in [("lat", "lon"), ("latitude", "longitude"), ("y", "x")]:
         if la in ds.coords and lo in ds.coords:
@@ -613,50 +613,95 @@ def _extract_pangu_records(ds, lat, lon, start):
             source="pangu",
         ))
     print(f"   Pangu: {len(recs)} daily records")
+
+    # Persist extracted Pangu records as a small JSON for cross-env reuse
+    try:
+        out_path = Path(PANGU_JSON)
+        out_path.write_text(json.dumps({
+            "extracted_at": datetime.now().isoformat(),
+            "lat": lat, "lon": lon, "start": start,
+            "records": [{
+                "timestamp": r.timestamp,
+                "ambient_c": r.ambient_c,
+                "wind_mps": r.wind_mps,
+                "wind_direction_deg": r.wind_direction_deg,
+                "wind_raw_mps": r.wind_raw_mps,
+            } for r in recs],
+        }))
+        print(f"   Pangu JSON export: {out_path} ({len(recs)} records)")
+    except Exception as e:
+        print(f"   Pangu JSON export failed: {e}")
+
     return recs
 
 
-def fetch_pangu_cached_only(lat, lon, start, hours=168, cache_dir=None):
-    """Load Pangu Zarr cache if it exists and is valid. Returns None if no cache."""
-    if not EARTH2STUDIO_AVAILABLE: return None
-    if not XARRAY_AVAILABLE: return None
-    if cache_dir is None:
-        cache_dir = CONFIG_DEFAULTS.get("ai_cache_dir", "./weather_cache")
-    key = f"pangu_{lat:.4f}_{lon:.4f}_{start}_{hours}h"
-    cache = Path(cache_dir) / f"{key}.zarr"
-    if not is_valid_zarr(cache):
-        print(f"   No fresh Pangu cache, skipping Pangu blend")
+def _load_pangu_from_json():
+    """Fallback: read Pangu records from pangu_forecast.json (Render path)."""
+    json_path = Path(PANGU_JSON)
+    if not json_path.exists():
         return None
-    print(f"   Loaded Pangu cache: {cache.name}")
     try:
-        ds = xr.open_zarr(str(cache))
-        return _extract_pangu_records(ds, lat, lon, start)
+        d = json.loads(json_path.read_text())
+        recs = []
+        for r in d.get("records", []):
+            recs.append(WeatherRec(
+                timestamp=r["timestamp"],
+                ambient_c=_s(r["ambient_c"]),
+                wind_mps=_s(r["wind_mps"]),
+                wind_direction_deg=_s(r["wind_direction_deg"]),
+                ghi_w_m2=0.0,
+                wind_raw_mps=_s(r.get("wind_raw_mps", 0.0)),
+                source="pangu_json",
+            ))
+        try:
+            age_h = (datetime.now() - datetime.fromisoformat(d["extracted_at"])).total_seconds() / 3600
+            age_str = f"{age_h:.1f}h old"
+        except Exception:
+            age_str = "age unknown"
+        print(f"   Loaded Pangu JSON: {len(recs)} records ({age_str})")
+        return recs if recs else None
     except Exception as e:
-        print(f"   Pangu cache read failed: {e}")
+        print(f"   Pangu JSON read failed: {e}")
         return None
+
+
+def fetch_pangu_cached_only(lat, lon, start, hours=168, cache_dir=None):
+    """Load Pangu records from Zarr cache (local), or fall back to JSON (Render)."""
+    # Try Zarr first (only works with earth2studio on laptop)
+    if EARTH2STUDIO_AVAILABLE and XARRAY_AVAILABLE:
+        if cache_dir is None:
+            cache_dir = CONFIG_DEFAULTS.get("ai_cache_dir", "./weather_cache")
+        key = f"pangu_{lat:.4f}_{lon:.4f}_{start}_{hours}h"
+        cache = Path(cache_dir) / f"{key}.zarr"
+        if is_valid_zarr(cache):
+            print(f"   Loaded Pangu cache: {cache.name}")
+            try:
+                ds = xr.open_zarr(str(cache))
+                return _extract_pangu_records(ds, lat, lon, start)
+            except Exception as e:
+                print(f"   Pangu Zarr read failed: {e}")
+
+    # Fall back to JSON (Render-friendly)
+    return _load_pangu_from_json()
 
 
 def pangu_weight(idx):
     """Weight Pangu anomaly by forecast day index (0-based). Trust closer days more."""
     if idx <= 1: return 1.0
-    if idx <= 3: return 1.0 - 0.10 * (idx - 1)   # 0.9, 0.8
-    if idx <= 6: return 0.70 - 0.10 * (idx - 3)  # 0.6, 0.5, 0.4, 0.3
+    if idx <= 3: return 1.0 - 0.10 * (idx - 1)
+    if idx <= 6: return 0.70 - 0.10 * (idx - 3)
     return 0.20
 
 
 def blend_ai(lat, lon, start, end, hours=168):
-    """
-    Blend Open-Meteo forecast with Pangu anomalies.
-    If Pangu cache is missing, returns pure Open-Meteo (no exception).
-    """
+    """Blend Open-Meteo forecast with Pangu anomalies. Falls back to pure OM if no Pangu."""
     om = fetch_om(lat, lon, start, end, forecast=True)
     if not om:
         return om
     pg = fetch_pangu_cached_only(lat, lon, start, hours)
     if pg is None:
-        return om  # Graceful fallback — no Pangu cache, use pure OM
+        return om
 
-    # Group OM by day to compute daily means
     om_by_day = {}
     for r in om:
         d = r.timestamp[:10]
@@ -666,7 +711,6 @@ def blend_ai(lat, lon, start, end, hours=168):
     om_daily = {d: {"T": sum(v["T"])/len(v["T"]), "W": sum(v["W"])/len(v["W"])}
                 for d, v in om_by_day.items()}
 
-    # Compute weighted Pangu anomalies per day
     anom = {}
     for i, p in enumerate(pg):
         d = p.timestamp[:10]
@@ -678,7 +722,6 @@ def blend_ai(lat, lon, start, end, hours=168):
             "W": (p.wind_mps - om_daily[d]["W"]) * w,
         }
 
-    # Apply anomalies hour-by-hour
     blended = []
     for r in om:
         d = r.timestamp[:10]
@@ -752,6 +795,12 @@ def build_pangu_cache():
         print(f"✅ Pangu inference complete: {cache}")
     else:
         print(f"Pangu Zarr already exists: {cache}")
+        # Force extract + JSON export from existing Zarr
+        try:
+            ds = xr.open_zarr(str(cache))
+            _extract_pangu_records(ds, lat, lon, start)
+        except Exception as e:
+            print(f"   Could not re-extract from Zarr: {e}")
 
     print("\nRebuilding forecast cache with Pangu blend...")
     _cached["last_updated"] = None
@@ -1216,6 +1265,7 @@ if app is not None:
         return {"version": VERSION, "conductor": CONFIG_DEFAULTS.get("conductor"),
                 "pvlib": PVLIB_AVAILABLE, "earth2studio": EARTH2STUDIO_AVAILABLE,
                 "mcp_loaded": MCP is not None,
+                "pangu_json_present": os.path.exists(PANGU_JSON),
                 "cache_records": len(_cached.get("data") or []),
                 "cache_source": _cached.get("source"),
                 "cache_last_updated": _cached.get("last_updated"),
@@ -1752,7 +1802,8 @@ def main():
     parser.add_argument("--api", action="store_true")
     parser.add_argument("--fresh", action="store_true")
     parser.add_argument("--run-pangu", action="store_true",
-                        help="Run Pangu inference (~60 min CPU) and rebuild cache")
+                        help="Run Pangu inference (~60 min CPU) and rebuild cache. "
+                             "If Zarr exists, re-extracts JSON instead.")
     parser.add_argument("--build-cache", action="store_true")
     parser.add_argument("--export-static", action="store_true")
     parser.add_argument("--port", type=int, default=8000)

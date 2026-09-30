@@ -1,51 +1,23 @@
-﻿# --- Python ---
-__pycache__/
-*.pyc
-*.pyo
-.venv/
-venv/
-env/
-
-# --- Runtime caches / data ---
+﻿# GridTweak ephemeral files
+forecast_cache.json
 dlr_data.db
-mcp_calibration.json
+config.json
+
+# Large Pangu output — cannot commit
 weather_cache/
 *.zarr/
-*.log
 
-# --- Large / irrelevant assets ---
-*.rar
-*.xlsx
-*.pdf
-GridDictionary2.csv
-physics_training_data*.csv
-validation_units_*.csv
-dynalird.csv
-*.png
-PMU-Frequency Data at 1-second Interval/
-Waveforms/
-Waveforms.rar
-digital-twin-dataset/
-wunderground_data/
-samples/
-pypacity/
+# Allow the small Pangu JSON
+!pangu_forecast.json
 
-# --- Old engine versions ---
-dlr_v28.py
-dlr_v30.py
-dlrfinal.py
-dlr_v2.8.py.bak
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
 
-# --- Editor / OS ---
-.vscode/
-.idea/
+# OS
 .DS_Store
 Thumbs.db
-
-# --- Scratch ---
-code.txt
-explore_sample_data.py
-inspect_ieee39.py
-scrape_wunderground.py
-extract_rar.py
-download_waveforms.py
+*.log
