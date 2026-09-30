@@ -1,9 +1,12 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-GridTweak DLR Engine - V2.14
-Static-export-first: --export-static pre-renders all API responses to disk.
-Endpoints serve those files directly when present — zero runtime API calls.
+GridTweak DLR Engine - V2.16
+V2.15.1 + Pangu-Weather integration restored.
+- Tier 1: blend_ai() (Open-Meteo + Pangu anomalies)
+- Tier 2: Open-Meteo forecast
+- Tier 3: Open-Meteo archive fallback
+Use --run-pangu once to build the ~60 min Zarr cache; subsequent runs load instantly.
 """
 
 import argparse, json, math, sys, os, shutil, warnings, time, threading, traceback, re
@@ -170,14 +173,13 @@ def _san(obj):
 
 
 # ============================================================================
-# CACHE + STATIC FILES
+# CACHE
 # ============================================================================
 _cached = {"data": None, "last_updated": None, "source": None,
            "building": False, "last_error": None, "last_attempt": None}
 CACHE_FILE = "forecast_cache.json"
 DB_FILE = "dlr_data.db"
 
-# Static pre-rendered responses (produced by --export-static)
 STATIC_CURRENT   = "static_current.json"
 STATIC_FORECAST  = "static_forecast.json"
 STATIC_CORRIDOR  = "static_corridor.json"
@@ -265,7 +267,7 @@ def maybe_auto_fresh():
 # ============================================================================
 # CONFIG
 # ============================================================================
-VERSION = "V2.14"
+VERSION = "V2.16"
 APP_NAME = "GridTweak"
 
 CONFIG_DEFAULTS = {
@@ -555,7 +557,7 @@ def enrich_solar(records, lat, lon):
 
 
 # ============================================================================
-# PANGU (skipped silently if unavailable)
+# PANGU
 # ============================================================================
 def is_valid_zarr(p):
     if not p.exists(): return False
@@ -567,9 +569,194 @@ def is_valid_zarr(p):
         return ok
     except Exception: return False
 
+
+def _extract_pangu_records(ds, lat, lon, start):
+    """Extract daily records for a grid point from the Pangu Zarr dataset."""
+    ds_pt = None
+    for la, lo in [("lat", "lon"), ("latitude", "longitude"), ("y", "x")]:
+        if la in ds.coords and lo in ds.coords:
+            try:
+                ds_pt = ds.sel({la: lat, lo: lon}, method="nearest")
+                break
+            except: continue
+    if ds_pt is None:
+        raise RuntimeError("Pangu grid point not found")
+
+    def gv(dp, *names):
+        for n in names:
+            if n in dp:
+                return np.asarray(dp[n].values).flatten()
+        raise KeyError(f"None of {names} in {list(dp.data_vars)}")
+
+    u10 = gv(ds_pt, 'u10m', 'u10', '10u')
+    v10 = gv(ds_pt, 'v10m', 'v10', '10v')
+    t2m = gv(ds_pt, 't2m', 't2', '2t')
+
+    ws = np.sqrt(u10**2 + v10**2)
+    wd = (270.0 - np.degrees(np.arctan2(v10, u10))) % 360.0
+
+    base = pd.Timestamp(start)
+    n = min(len(ws), len(t2m))
+    ts = [(base + timedelta(hours=i * 24)).isoformat() for i in range(n)]
+
+    recs = []
+    for i in range(n):
+        w_raw = _s(ws[i])
+        w_mcp = apply_mcp(w_raw) if CONFIG_DEFAULTS.get("use_mcp_correction", True) else w_raw
+        recs.append(WeatherRec(
+            timestamp=ts[i],
+            ambient_c=_s(t2m[i] - 273.15, 15.0),
+            wind_mps=_s(w_mcp),
+            wind_direction_deg=_s(wd[i]),
+            ghi_w_m2=0.0,
+            wind_raw_mps=w_raw,
+            source="pangu",
+        ))
+    print(f"   Pangu: {len(recs)} daily records")
+    return recs
+
+
 def fetch_pangu_cached_only(lat, lon, start, hours=168, cache_dir=None):
+    """Load Pangu Zarr cache if it exists and is valid. Returns None if no cache."""
     if not EARTH2STUDIO_AVAILABLE: return None
-    return None
+    if not XARRAY_AVAILABLE: return None
+    if cache_dir is None:
+        cache_dir = CONFIG_DEFAULTS.get("ai_cache_dir", "./weather_cache")
+    key = f"pangu_{lat:.4f}_{lon:.4f}_{start}_{hours}h"
+    cache = Path(cache_dir) / f"{key}.zarr"
+    if not is_valid_zarr(cache):
+        print(f"   No fresh Pangu cache, skipping Pangu blend")
+        return None
+    print(f"   Loaded Pangu cache: {cache.name}")
+    try:
+        ds = xr.open_zarr(str(cache))
+        return _extract_pangu_records(ds, lat, lon, start)
+    except Exception as e:
+        print(f"   Pangu cache read failed: {e}")
+        return None
+
+
+def pangu_weight(idx):
+    """Weight Pangu anomaly by forecast day index (0-based). Trust closer days more."""
+    if idx <= 1: return 1.0
+    if idx <= 3: return 1.0 - 0.10 * (idx - 1)   # 0.9, 0.8
+    if idx <= 6: return 0.70 - 0.10 * (idx - 3)  # 0.6, 0.5, 0.4, 0.3
+    return 0.20
+
+
+def blend_ai(lat, lon, start, end, hours=168):
+    """
+    Blend Open-Meteo forecast with Pangu anomalies.
+    If Pangu cache is missing, returns pure Open-Meteo (no exception).
+    """
+    om = fetch_om(lat, lon, start, end, forecast=True)
+    if not om:
+        return om
+    pg = fetch_pangu_cached_only(lat, lon, start, hours)
+    if pg is None:
+        return om  # Graceful fallback — no Pangu cache, use pure OM
+
+    # Group OM by day to compute daily means
+    om_by_day = {}
+    for r in om:
+        d = r.timestamp[:10]
+        om_by_day.setdefault(d, {"T": [], "W": []})
+        om_by_day[d]["T"].append(r.ambient_c)
+        om_by_day[d]["W"].append(r.wind_mps)
+    om_daily = {d: {"T": sum(v["T"])/len(v["T"]), "W": sum(v["W"])/len(v["W"])}
+                for d, v in om_by_day.items()}
+
+    # Compute weighted Pangu anomalies per day
+    anom = {}
+    for i, p in enumerate(pg):
+        d = p.timestamp[:10]
+        if d not in om_daily:
+            continue
+        w = pangu_weight(i)
+        anom[d] = {
+            "T": (p.ambient_c - om_daily[d]["T"]) * w,
+            "W": (p.wind_mps - om_daily[d]["W"]) * w,
+        }
+
+    # Apply anomalies hour-by-hour
+    blended = []
+    for r in om:
+        d = r.timestamp[:10]
+        a = anom.get(d, {"T": 0.0, "W": 0.0})
+        blended.append(WeatherRec(
+            timestamp=r.timestamp,
+            ambient_c=r.ambient_c + a["T"],
+            wind_mps=max(0.1, r.wind_mps + a["W"]),
+            wind_direction_deg=r.wind_direction_deg,
+            ghi_w_m2=r.ghi_w_m2,
+            dni_w_m2=r.dni_w_m2,
+            dhi_w_m2=r.dhi_w_m2,
+            wind_raw_mps=r.wind_raw_mps,
+            source="om_mcp+pangu",
+        ))
+    print(f"   Blended: {len(blended)} records (OM + Pangu anomalies)")
+    return blended
+
+
+def build_pangu_cache():
+    """Run Pangu-Weather inference via earth2studio and save to Zarr. ~60 min on CPU."""
+    if not EARTH2STUDIO_AVAILABLE:
+        print("❌ Earth2Studio not available"); return 1
+    if not XARRAY_AVAILABLE:
+        print("❌ xarray not available"); return 1
+
+    lat = CONFIG_DEFAULTS["lat"]; lon = CONFIG_DEFAULTS["lon"]
+    start = datetime.now().strftime("%Y-%m-%d")
+    hours = CONFIG_DEFAULTS.get("ai_forecast_hours", 168)
+    cache_dir = CONFIG_DEFAULTS.get("ai_cache_dir", "./weather_cache")
+    try:
+        Path(cache_dir).mkdir(parents=True, exist_ok=True)
+    except Exception as e:
+        print(f"Cannot create cache dir: {e}"); return 1
+
+    key = f"pangu_{lat:.4f}_{lon:.4f}_{start}_{hours}h"
+    cache = Path(cache_dir) / f"{key}.zarr"
+
+    if not is_valid_zarr(cache):
+        print(f"Running Pangu inference (~60 min on CPU)...")
+        print(f"   Target: {cache}")
+        if cache.exists():
+            try: shutil.rmtree(cache, ignore_errors=True)
+            except: pass
+
+        dev = CONFIG_DEFAULTS.get("ai_device", "cpu")
+        onnx = CONFIG_DEFAULTS.get("pangu_onnx_path") or find_onnx()
+        if not onnx:
+            print("❌ Pangu ONNX model not found.")
+            print("   Expected at: ~/.cache/earth2studio/pangu/pangu_weather_24.onnx")
+            print("   Or set pangu_onnx_path in config.")
+            return 1
+        print(f"   Using ONNX: {onnx}")
+
+        if dev == "cpu" and TORCH_AVAILABLE:
+            try: torch.set_default_device("cpu")
+            except: pass
+
+        model = Pangu24(ort_24hr=onnx)
+        data = GFS()
+        n = max(1, hours // 24)
+        io = ZarrBackend(str(cache))
+        print(f"   Running {n} steps ({n*24}h horizon)...")
+        run_deterministic(
+            time=[start], nsteps=n, prognostic=model, data=data, io=io,
+            device=torch.device(dev) if TORCH_AVAILABLE else None,
+        )
+        try:
+            if hasattr(io, "close"): io.close()
+        except: pass
+        print(f"✅ Pangu inference complete: {cache}")
+    else:
+        print(f"Pangu Zarr already exists: {cache}")
+
+    print("\nRebuilding forecast cache with Pangu blend...")
+    _cached["last_updated"] = None
+    update_forecast_cache(force=True)
+    return 0
 
 
 # ============================================================================
@@ -592,8 +779,7 @@ def fetch_om(lat, lon, start, end, tz="auto", forecast=False, quick=False):
     if forecast:
         base = "https://api.open-meteo.com/v1/forecast"
         params = {"latitude": lat, "longitude": lon, "hourly": HOURLY,
-                  "wind_speed_unit": "ms", "timezone": tz,
-                  "forecast_days": 7}
+                  "wind_speed_unit": "ms", "timezone": tz, "forecast_days": 7}
         kind = "forecast"
     elif end_dt is not None and end_dt <= archive_cutoff:
         base = "https://archive-api.open-meteo.com/v1/archive"
@@ -775,6 +961,29 @@ def fetch_weather_multi_year(lat, lon, start, end, quick=False):
     return all_recs
 
 
+# ============================================================================
+# ELEVATION
+# ============================================================================
+_ELEV_CACHE = {}
+
+def fetch_elevation(lat, lon):
+    key = (round(lat, 4), round(lon, 4))
+    if key in _ELEV_CACHE:
+        return _ELEV_CACHE[key]
+    try:
+        url = f"https://api.open-meteo.com/v1/elevation?latitude={lat}&longitude={lon}"
+        req = urllib.request.Request(url, headers={'User-Agent': 'GridTweak/1.0'})
+        with urllib.request.urlopen(req, timeout=5) as r:
+            data = json.loads(r.read().decode())
+            elevs = data.get("elevation", [0])
+            elev = _s(elevs[0]) if elevs else 0.0
+            _ELEV_CACHE[key] = elev
+            return elev
+    except Exception as e:
+        print(f"   Elevation fetch failed for ({lat:.4f},{lon:.4f}): {e}")
+        return 0.0
+
+
 def segments_from_cache(nseg, lat, lon, elat, elon):
     cached = _cached.get("data") or []
     if not cached: return []
@@ -784,11 +993,13 @@ def segments_from_cache(nseg, lat, lon, elat, elon):
               for i in range(nseg + 1)]
     import random
     random.seed(42)
+    print(f"   Fetching elevation for {len(coords)} segment points...")
     for i, (slat, slon) in enumerate(coords):
         jitter = 1.0 + random.uniform(-0.03, 0.03)
         dlr_a = (base.get("dlr_a", 0) or 0) * jitter
+        elev = fetch_elevation(slat, slon)
         segs.append({
-            "lat": slat, "lon": slon, "elevation_m": 0,
+            "lat": slat, "lon": slon, "elevation_m": elev,
             "min_dlr_a": dlr_a,
             "min_dlr_mw": amps_to_mw(dlr_a, CONFIG_DEFAULTS["nominal_voltage_kv"],
                                       CONFIG_DEFAULTS["power_factor"]),
@@ -799,6 +1010,7 @@ def segments_from_cache(nseg, lat, lon, elat, elon):
             "worst_hour": base.get("timestamp", ""),
             "results": [],
         })
+    print(f"   Elevations: {[round(s['elevation_m'],1) for s in segs]}")
     return segs
 
 
@@ -826,23 +1038,42 @@ def update_forecast_cache(force=False):
         c = get_conductor(CONFIG_DEFAULTS["conductor"])
         start = datetime.now().strftime("%Y-%m-%d")
         end = (datetime.now() + timedelta(days=7)).strftime("%Y-%m-%d")
+        force_archive = CONFIG_DEFAULTS.get("force_archive_forecast", False)
 
         weather = None; source = ""
-        try:
-            print("  [Tier 1] Open-Meteo forecast API")
-            weather = fetch_om(lat, lon, start, end, forecast=True)
-            if weather:
-                if PVLIB_AVAILABLE:
-                    try: weather = enrich_solar(weather, lat, lon)
-                    except Exception: pass
-                weather = smooth_wind(weather)
-                source = "openmeteo_forecast"
-        except Exception as e:
-            print(f"  Tier 1 failed: {type(e).__name__}: {e}")
+
+        if not force_archive:
+            try:
+                print("  [Tier 1] AI blend (Pangu + OM forecast)")
+                weather = blend_ai(lat, lon, start, end,
+                                    hours=CONFIG_DEFAULTS.get("ai_forecast_hours", 168))
+                if weather:
+                    if PVLIB_AVAILABLE:
+                        try: weather = enrich_solar(weather, lat, lon)
+                        except Exception: pass
+                    weather = smooth_wind(weather)
+                    source = weather[0].source if weather else "ai_blend"
+            except Exception as e:
+                print(f"  Tier 1 failed: {type(e).__name__}: {e}")
+                weather = None
+
+        if not weather and not force_archive:
+            try:
+                print("  [Tier 2] Open-Meteo forecast API")
+                weather = fetch_om(lat, lon, start, end, forecast=True)
+                if weather:
+                    if PVLIB_AVAILABLE:
+                        try: weather = enrich_solar(weather, lat, lon)
+                        except Exception: pass
+                    weather = smooth_wind(weather)
+                    source = "openmeteo_forecast"
+            except Exception as e:
+                print(f"  Tier 2 failed: {type(e).__name__}: {e}")
+                weather = None
 
         if not weather:
             try:
-                print("  [Tier 2] Open-Meteo archive fallback")
+                print("  [Tier 3] Open-Meteo archive fallback")
                 ast = (datetime.now() - timedelta(days=7)).strftime("%Y-%m-%d")
                 weather = fetch_om(lat, lon, ast, end, forecast=False)
                 if weather:
@@ -852,7 +1083,8 @@ def update_forecast_cache(force=False):
                     weather = smooth_wind(weather)
                     source = "archive_fallback"
             except Exception as e:
-                print(f"  Tier 2 failed: {type(e).__name__}: {e}")
+                print(f"  Tier 3 failed: {type(e).__name__}: {e}")
+                weather = None
 
         if not weather:
             msg = "All tiers returned no weather data"
@@ -875,7 +1107,7 @@ def update_forecast_cache(force=False):
 
 
 # ============================================================================
-# STATIC EXPORT — renders all four API responses and writes them to disk
+# STATIC EXPORT
 # ============================================================================
 def export_static_files():
     print("\n=== Exporting static response files ===")
@@ -889,7 +1121,6 @@ def export_static_files():
     if not cached:
         print("⚠️ No cache data — cannot export static files"); return False
 
-    # --- static_current.json: first 24 records ---------------------------
     current_recs = list(cached[:24]) if len(cached) >= 24 else list(cached)
     _write_static(STATIC_CURRENT, {
         "results": current_recs,
@@ -899,7 +1130,6 @@ def export_static_files():
         "source": "static",
     })
 
-    # --- static_forecast.json: all records -------------------------------
     _write_static(STATIC_FORECAST, {
         "forecast": cached,
         "source": _cached.get("source") or "static",
@@ -907,7 +1137,6 @@ def export_static_files():
         "last_error": None,
     })
 
-    # --- static_corridor.json: 4 segments from cache ---------------------
     lat = CONFIG_DEFAULTS["lat"]; lon = CONFIG_DEFAULTS["lon"]
     elat = CONFIG_DEFAULTS.get("end_lat") or (lat + 0.5)
     elon = CONFIG_DEFAULTS.get("end_lon") or (lon + 0.5)
@@ -925,7 +1154,6 @@ def export_static_files():
                       "worst_hour": s["worst_hour"]} for s in segs],
     })
 
-    # --- static_sag_comparison.json --------------------------------------
     tower_h = CONFIG_DEFAULTS.get("tower_attachment_height_m", 30.0)
     min_clr = CONFIG_DEFAULTS.get("min_clearance_m", 7.0)
     corridor_span = CONFIG_DEFAULTS.get("span_length_m", 400.0)
@@ -955,7 +1183,6 @@ def export_static_files():
         "gt_curve": gt_curve, "utility_benchmarks": comparisons,
     })
 
-    # --- static_sag_check.json -------------------------------------------
     span = CONFIG_DEFAULTS.get("span_length_m", 400.0)
     rows = []
     for tc in range(20, 101, 5):
@@ -991,14 +1218,9 @@ if app is not None:
                 "mcp_loaded": MCP is not None,
                 "cache_records": len(_cached.get("data") or []),
                 "cache_source": _cached.get("source"),
+                "cache_last_updated": _cached.get("last_updated"),
                 "cache_building": _cached.get("building", False),
                 "cache_last_error": _cached.get("last_error"),
-                "static_files_present": {
-                    STATIC_CURRENT: os.path.exists(STATIC_CURRENT),
-                    STATIC_FORECAST: os.path.exists(STATIC_FORECAST),
-                    STATIC_CORRIDOR: os.path.exists(STATIC_CORRIDOR),
-                    STATIC_SAGCOMP: os.path.exists(STATIC_SAGCOMP),
-                },
                 "auto_fresh": os.environ.get("GRIDTWEAK_AUTO_FRESH", "0")}
 
     @app.get("/dlr/cache_status")
@@ -1030,7 +1252,6 @@ if app is not None:
     async def sag_check():
         s = _read_static(STATIC_SAGCHECK)
         if s is not None: return JSONResponse(content=s)
-        # fallback: compute
         c = get_conductor(CONFIG_DEFAULTS["conductor"])
         span = CONFIG_DEFAULTS.get("span_length_m", 400.0)
         tower_h = CONFIG_DEFAULTS.get("tower_attachment_height_m", 30.0)
@@ -1050,7 +1271,6 @@ if app is not None:
     async def sag_comparison():
         s = _read_static(STATIC_SAGCOMP)
         if s is not None: return JSONResponse(content=s)
-        # fallback: compute
         c = get_conductor(CONFIG_DEFAULTS["conductor"])
         tower_h = CONFIG_DEFAULTS.get("tower_attachment_height_m", 30.0)
         min_clr = CONFIG_DEFAULTS.get("min_clearance_m", 7.0)
@@ -1092,9 +1312,7 @@ if app is not None:
     @app.get("/dlr/current")
     async def get_current():
         s = _read_static(STATIC_CURRENT)
-        if s is not None:
-            return JSONResponse(content=s)
-        # fallback: derive from cache
+        if s is not None: return JSONResponse(content=s)
         cached = _cached.get("data") or []
         c = get_conductor(CONFIG_DEFAULTS["conductor"])
         kv = CONFIG_DEFAULTS["nominal_voltage_kv"]; pf = CONFIG_DEFAULTS["power_factor"]
@@ -1115,8 +1333,7 @@ if app is not None:
     @app.get("/dlr/forecast")
     async def get_forecast():
         s = _read_static(STATIC_FORECAST)
-        if s is not None:
-            return JSONResponse(content=s)
+        if s is not None: return JSONResponse(content=s)
         if _cached["data"] is None:
             return JSONResponse(content={"forecast": [], "source": None,
                                           "building": _cached.get("building", False),
@@ -1136,9 +1353,7 @@ if app is not None:
     @app.get("/dlr/corridor")
     async def get_corridor():
         s = _read_static(STATIC_CORRIDOR)
-        if s is not None:
-            return JSONResponse(content=s)
-        # fallback: segments from cache
+        if s is not None: return JSONResponse(content=s)
         try:
             lat = CONFIG_DEFAULTS["lat"]; lon = CONFIG_DEFAULTS["lon"]
             elat = CONFIG_DEFAULTS.get("end_lat") or (lat + 0.5)
@@ -1283,7 +1498,7 @@ GridTweak's parabolic sag model compared against published sag values from PGCIL
 <div class="footer">
 <div style="font-size:11px;color:#718096;margin-bottom:8px;line-height:1.6;">
 Thermal headroom only. Network transfer capability may be constrained by other system limits.
-<span style="display:inline-block;margin-left:12px;font-size:10px;background:#f0f4f8;padding:2px 8px;border-radius:12px;color:#4a5568;">V2.14 | IEEE 738 | Sag benchmarks</span>
+<span style="display:inline-block;margin-left:12px;font-size:10px;background:#f0f4f8;padding:2px 8px;border-radius:12px;color:#4a5568;">{VERSION} | IEEE 738 | Sag benchmarks</span>
 </div>
 &copy; 2026 GridTweak
 </div></div>
@@ -1472,7 +1687,8 @@ async function fetchCorridor() {{
         data.segments.forEach((s, i) => {{
             const clrStatus = s.clearance_m >= {min_clr_js} ? 'status-ok' : 'status-warn';
             const bind = s.binding_constraint === 'clearance' ? 'clearance' : 'thermal';
-            html += `<tr><td>${{i+1}}</td><td>${{s.min_dlr_mw.toFixed(0)}}</td><td>${{s.temperature_c.toFixed(1)}}</td><td>${{s.sag_m.toFixed(2)}}</td><td class="${{clrStatus}}">${{s.clearance_m.toFixed(2)}}</td><td>${{bind}}</td><td>${{s.elevation_m.toFixed(0)}}</td></tr>`;
+            const elev = (s.elevation_m || 0).toFixed(0);
+            html += `<tr><td>${{i+1}}</td><td>${{s.min_dlr_mw.toFixed(0)}}</td><td>${{s.temperature_c.toFixed(1)}}</td><td>${{s.sag_m.toFixed(2)}}</td><td class="${{clrStatus}}">${{s.clearance_m.toFixed(2)}}</td><td>${{bind}}</td><td>${{elev}}</td></tr>`;
         }});
         html += '</table>';
         document.getElementById('corridorTable').innerHTML = html;
@@ -1485,11 +1701,13 @@ async function fetchSagComparison() {{
         if (!r.ok) return;
         const data = await r.json();
         if (!data.utility_benchmarks) return;
+
         let html = '<table style="margin-bottom:16px;"><tr><th>Temp (C)</th><th>Sag @ 350m (m)</th><th>Sag @ corridor (m)</th><th>Clearance @ corridor (m)</th></tr>';
         data.gt_curve.forEach(row => {{
             html += `<tr><td>${{row.temp_c}}</td><td>${{row.gt_sag_350m_m.toFixed(2)}}</td><td>${{row.gt_sag_corridor_m.toFixed(2)}}</td><td>${{row.clearance_corridor_m.toFixed(2)}}</td></tr>`;
         }});
         html += '</table>';
+
         html += '<table><tr><th>Source</th><th>Conductor</th><th>Span (m)</th><th>Temp (C)</th><th>Reported Sag (m)</th><th>GridTweak Sag (m)</th><th>Diff (%)</th></tr>';
         data.utility_benchmarks.forEach(b => {{
             const rep = b.sag_m !== null ? b.sag_m.toFixed(3) : '-';
@@ -1503,6 +1721,7 @@ async function fetchSagComparison() {{
         }});
         html += '</table>';
         html += '<p style="font-size:11px;color:#718096;margin-top:8px;">Notes: PGCIL (10.600m) and AEGCL (8.435m) use different stringing tensions. GridTweak matches PGCIL within the tolerance band. Diff % shown is (GridTweak - Reported) / Reported.</p>';
+
         document.getElementById('sagComparisonTable').innerHTML = html;
     }} catch(e) {{ console.error('Sag comparison error:', e); }}
 }}
@@ -1532,10 +1751,10 @@ def main():
     parser.add_argument("--config", type=str)
     parser.add_argument("--api", action="store_true")
     parser.add_argument("--fresh", action="store_true")
-    parser.add_argument("--run-pangu", action="store_true")
+    parser.add_argument("--run-pangu", action="store_true",
+                        help="Run Pangu inference (~60 min CPU) and rebuild cache")
     parser.add_argument("--build-cache", action="store_true")
-    parser.add_argument("--export-static", action="store_true",
-                        help="Build cache then write static_*.json response files")
+    parser.add_argument("--export-static", action="store_true")
     parser.add_argument("--port", type=int, default=8000)
     args = parser.parse_args()
 
@@ -1572,7 +1791,9 @@ def main():
         clear_cache_state()
         print("Cleared all in-memory cache state")
 
-    # --export-static: build cache then dump all four response files
+    if args.run_pangu:
+        return build_pangu_cache()
+
     if args.export_static:
         _cached["last_updated"] = None
         print("\nBuilding fresh cache for export...")
@@ -1592,13 +1813,10 @@ def main():
         print(f"\nRESULT: {n} records via {_cached.get('source')}")
         return 0 if n > 0 else 1
 
-    if args.run_pangu: return 1
-
     if args.api:
         if not API_AVAILABLE: return 1
         print(f"\nAPI:         http://localhost:{port}")
         print(f"Dashboard:   http://localhost:{port}/dashboard")
-        # Static files take precedence; only refresh in background if missing
         statics_present = all(os.path.exists(f) for f in
                               [STATIC_CURRENT, STATIC_FORECAST, STATIC_CORRIDOR])
         if statics_present:
