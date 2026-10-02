@@ -1,10 +1,8 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-GridTweak DLR Engine - V2.16.1
-V2.16 + Pangu JSON export for cross-env deploy.
-- Local (laptop): full Pangu via earth2studio + Zarr cache
-- Render: reads pangu_forecast.json (small) for AI blend without earth2studio
+GridTweak DLR Engine - V2.16.2
+V2.16.1 + smarter startup: always-on scheduler + cache-age check.
 """
 
 import argparse, json, math, sys, os, shutil, warnings, time, threading, traceback, re
@@ -267,7 +265,7 @@ def maybe_auto_fresh():
 # ============================================================================
 # CONFIG
 # ============================================================================
-VERSION = "V2.16.1"
+VERSION = "V2.16.2"
 APP_NAME = "GridTweak"
 
 CONFIG_DEFAULTS = {
@@ -571,7 +569,7 @@ def is_valid_zarr(p):
 
 
 def _extract_pangu_records(ds, lat, lon, start):
-    """Extract daily records from Pangu Zarr, and write a small JSON extract."""
+    """Extract daily records from Pangu Zarr + write JSON export."""
     ds_pt = None
     for la, lo in [("lat", "lon"), ("latitude", "longitude"), ("y", "x")]:
         if la in ds.coords and lo in ds.coords:
@@ -614,7 +612,6 @@ def _extract_pangu_records(ds, lat, lon, start):
         ))
     print(f"   Pangu: {len(recs)} daily records")
 
-    # Persist extracted Pangu records as a small JSON for cross-env reuse
     try:
         out_path = Path(PANGU_JSON)
         out_path.write_text(json.dumps({
@@ -636,7 +633,6 @@ def _extract_pangu_records(ds, lat, lon, start):
 
 
 def _load_pangu_from_json():
-    """Fallback: read Pangu records from pangu_forecast.json (Render path)."""
     json_path = Path(PANGU_JSON)
     if not json_path.exists():
         return None
@@ -666,8 +662,6 @@ def _load_pangu_from_json():
 
 
 def fetch_pangu_cached_only(lat, lon, start, hours=168, cache_dir=None):
-    """Load Pangu records from Zarr cache (local), or fall back to JSON (Render)."""
-    # Try Zarr first (only works with earth2studio on laptop)
     if EARTH2STUDIO_AVAILABLE and XARRAY_AVAILABLE:
         if cache_dir is None:
             cache_dir = CONFIG_DEFAULTS.get("ai_cache_dir", "./weather_cache")
@@ -680,13 +674,10 @@ def fetch_pangu_cached_only(lat, lon, start, hours=168, cache_dir=None):
                 return _extract_pangu_records(ds, lat, lon, start)
             except Exception as e:
                 print(f"   Pangu Zarr read failed: {e}")
-
-    # Fall back to JSON (Render-friendly)
     return _load_pangu_from_json()
 
 
 def pangu_weight(idx):
-    """Weight Pangu anomaly by forecast day index (0-based). Trust closer days more."""
     if idx <= 1: return 1.0
     if idx <= 3: return 1.0 - 0.10 * (idx - 1)
     if idx <= 6: return 0.70 - 0.10 * (idx - 3)
@@ -694,7 +685,6 @@ def pangu_weight(idx):
 
 
 def blend_ai(lat, lon, start, end, hours=168):
-    """Blend Open-Meteo forecast with Pangu anomalies. Falls back to pure OM if no Pangu."""
     om = fetch_om(lat, lon, start, end, forecast=True)
     if not om:
         return om
@@ -742,7 +732,6 @@ def blend_ai(lat, lon, start, end, hours=168):
 
 
 def build_pangu_cache():
-    """Run Pangu-Weather inference via earth2studio and save to Zarr. ~60 min on CPU."""
     if not EARTH2STUDIO_AVAILABLE:
         print("❌ Earth2Studio not available"); return 1
     if not XARRAY_AVAILABLE:
@@ -771,8 +760,6 @@ def build_pangu_cache():
         onnx = CONFIG_DEFAULTS.get("pangu_onnx_path") or find_onnx()
         if not onnx:
             print("❌ Pangu ONNX model not found.")
-            print("   Expected at: ~/.cache/earth2studio/pangu/pangu_weather_24.onnx")
-            print("   Or set pangu_onnx_path in config.")
             return 1
         print(f"   Using ONNX: {onnx}")
 
@@ -795,7 +782,6 @@ def build_pangu_cache():
         print(f"✅ Pangu inference complete: {cache}")
     else:
         print(f"Pangu Zarr already exists: {cache}")
-        # Force extract + JSON export from existing Zarr
         try:
             ds = xr.open_zarr(str(cache))
             _extract_pangu_records(ds, lat, lon, start)
@@ -1801,9 +1787,7 @@ def main():
     parser.add_argument("--config", type=str)
     parser.add_argument("--api", action="store_true")
     parser.add_argument("--fresh", action="store_true")
-    parser.add_argument("--run-pangu", action="store_true",
-                        help="Run Pangu inference (~60 min CPU) and rebuild cache. "
-                             "If Zarr exists, re-extracts JSON instead.")
+    parser.add_argument("--run-pangu", action="store_true")
     parser.add_argument("--build-cache", action="store_true")
     parser.add_argument("--export-static", action="store_true")
     parser.add_argument("--port", type=int, default=8000)
@@ -1868,24 +1852,68 @@ def main():
         if not API_AVAILABLE: return 1
         print(f"\nAPI:         http://localhost:{port}")
         print(f"Dashboard:   http://localhost:{port}/dashboard")
+
+        # Diagnostic: what's available?
         statics_present = all(os.path.exists(f) for f in
                               [STATIC_CURRENT, STATIC_FORECAST, STATIC_CORRIDOR])
-        if statics_present:
-            print("Serving pre-rendered static files — no live API calls on request path")
-        elif _cached["data"]:
-            print(f"Serving pre-built cache ({len(_cached['data'])} records)")
-        else:
-            print("No static files or cache — endpoints will return empty")
+        cache_age_h = None
+        if _cached.get("last_updated"):
+            try:
+                age_s = (datetime.now() - datetime.fromisoformat(_cached["last_updated"])).total_seconds()
+                cache_age_h = age_s / 3600
+            except: pass
 
-        if SCHEDULER_AVAILABLE and not statics_present:
+        if statics_present:
+            if cache_age_h is not None:
+                print(f"Serving static files (cache age: {cache_age_h:.1f}h)")
+            else:
+                print("Serving static files (age unknown)")
+        elif _cached["data"]:
+            print(f"Serving pre-built cache ({len(_cached['data'])} records, age: {cache_age_h or 0:.1f}h)")
+        else:
+            print("⚠️ No static files or cache — endpoints will return empty until first refresh completes")
+
+        # Layer 2: startup refresh if cache is stale (> 12h) or missing
+        STALE_THRESHOLD_H = 12
+        needs_startup_refresh = (
+            not statics_present or
+            cache_age_h is None or
+            cache_age_h > STALE_THRESHOLD_H
+        )
+        if needs_startup_refresh:
+            print(f"Cache stale or missing (age: {cache_age_h if cache_age_h else 'N/A'}h) — background refresh starting")
+            def _startup_refresh():
+                try:
+                    _cached["last_updated"] = None
+                    update_forecast_cache(force=True)
+                    export_static_files()
+                except Exception as e:
+                    print(f"Startup refresh failed: {e}")
+            threading.Thread(target=_startup_refresh, daemon=True).start()
+        else:
+            print(f"Cache fresh ({cache_age_h:.1f}h < {STALE_THRESHOLD_H}h) — no startup refresh needed")
+
+        # Layer 3: in-process scheduler — always runs while the service is up
+        if SCHEDULER_AVAILABLE:
             try:
                 sched = BackgroundScheduler()
-                sched.add_job(update_forecast_cache, "interval",
-                              hours=CONFIG_DEFAULTS.get("scheduler_interval_hours", 6))
+                def _scheduled_refresh():
+                    try:
+                        print("⏰ Scheduled refresh starting...")
+                        _cached["last_updated"] = None
+                        update_forecast_cache(force=True)
+                        export_static_files()
+                        print("⏰ Scheduled refresh complete")
+                    except Exception as e:
+                        print(f"Scheduled refresh failed: {e}")
+                interval_h = CONFIG_DEFAULTS.get("scheduler_interval_hours", 6)
+                sched.add_job(_scheduled_refresh, "interval", hours=interval_h)
                 sched.start()
-                print(f"Forecast refreshes every {CONFIG_DEFAULTS.get('scheduler_interval_hours', 6)}h")
+                print(f"⏰ In-process scheduler active — refreshes every {interval_h}h")
             except Exception as e:
                 print(f"Scheduler skipped: {e}")
+        else:
+            print("⚠️ APScheduler not available — only GitHub Actions will refresh cache")
 
         uvicorn.run(app, host="0.0.0.0", port=port)
         return 0

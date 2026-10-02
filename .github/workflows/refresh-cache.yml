@@ -1,0 +1,61 @@
+name: Refresh GridTweak Forecast Cache
+
+on:
+  schedule:
+    - cron: '30 21 * * *'      # 21:30 UTC = 03:00 IST next day
+  workflow_dispatch:
+
+jobs:
+  refresh:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set up Python 3.10
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: |
+          pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Regenerate cache and static files
+        env:
+          GRIDTWEAK_AUTO_FRESH: "0"
+        run: python dlr_v2.8.py --export-static
+
+      - name: Verify output files
+        run: |
+          ls -la forecast_cache.json static_*.json
+          python -c "import json; d=json.load(open('forecast_cache.json')); print(f\"Records: {len(d.get('data', []))}, Source: {d.get('source')}, Updated: {d.get('last_updated')}\")"
+
+      - name: Check for changes
+        id: check
+        run: |
+          git add forecast_cache.json static_*.json pangu_forecast.json 2>/dev/null || true
+          if git diff --cached --quiet; then
+            echo "changed=false" >> $GITHUB_OUTPUT
+          else
+            echo "changed=true" >> $GITHUB_OUTPUT
+            git diff --cached --stat
+          fi
+
+      - name: Commit and push
+        if: steps.check.outputs.changed == 'true'
+        run: |
+          git config user.name "GridTweak Bot"
+          git config user.email "bot@gridtweak.com"
+          git commit -m "Auto-refresh forecast cache — $(date -u +'%Y-%m-%d %H:%M UTC')"
+          git push

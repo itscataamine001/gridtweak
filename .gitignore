@@ -1,14 +1,10 @@
-﻿# GridTweak ephemeral files
-forecast_cache.json
+﻿# GridTweak ephemeral — ignored
 dlr_data.db
 config.json
 
-# Large Pangu output — cannot commit
+# Large Pangu Zarr — cannot commit
 weather_cache/
 *.zarr/
-
-# Allow the small Pangu JSON
-!pangu_forecast.json
 
 # Python
 __pycache__/
@@ -16,8 +12,11 @@ __pycache__/
 *.egg-info/
 .venv/
 venv/
+.pytest_cache/
 
 # OS
 .DS_Store
 Thumbs.db
+
+# Logs
 *.log
