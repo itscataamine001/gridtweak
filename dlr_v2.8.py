@@ -302,6 +302,10 @@ CONFIG_DEFAULTS = {
     "database_path": DB_FILE, "ml_model_path": "lgb_best.pkl", "use_ml": False,
     "scheduler_interval_hours": 6,
     "timezone_offset_hours": 5.5,
+
+    # Conservative derating applied to the Operational DLR only.
+    # Not surfaced in the dashboard UI. Reduces reported headroom.
+    "operational_derate_factor": 0.86,
 }
 
 
@@ -927,6 +931,7 @@ def run_dlr_records(records, c):
     offset = CONFIG_DEFAULTS.get("timezone_offset_hours", 5.5)
     static_fixed_a = compute_static_rating_A(c)
     tower_h = CONFIG_DEFAULTS.get("tower_attachment_height_m", 30.0)
+    derate = CONFIG_DEFAULTS.get("operational_derate_factor", 1.0)
 
     for w in records:
         try:
@@ -942,6 +947,17 @@ def run_dlr_records(records, c):
         clr_result = clearance_limited_dlr(_s(w.ambient_c), wp, _s(w.ghi_w_m2),
                                             sp["altitude_deg"], sp["azimuth_deg"],
                                             c, LINE_AZ, atk)
+
+        # --- operational derate (conservative margin, not shown in UI) ---
+        dlr_raw_a = _s(clr_result["dlr_a"])
+        dlr_op_a  = dlr_raw_a * derate
+        tr_op = solve_temp(dlr_op_a, _s(w.ambient_c), wp, _s(w.ghi_w_m2),
+                           sp["altitude_deg"], sp["azimuth_deg"], c, LINE_AZ, atk)
+        temp_op = _s(tr_op["temperature_c"])
+        sag_op  = calc_sag(temp_op, c)
+        clr_op  = tower_h - sag_op
+        # ------------------------------------------------------------------
+
         T_emerg = CONFIG_DEFAULTS.get("emergency_tmax_c", 100.0)
         dlr_emerg = solve_dlr(_s(w.ambient_c), wp, _s(w.ghi_w_m2),
                               sp["altitude_deg"], sp["azimuth_deg"],
@@ -965,17 +981,17 @@ def run_dlr_records(records, c):
             "perpendicular_wind_mps": _s(wp),
             "ghi_w_m2": _s(w.ghi_w_m2),
             "poa_w_m2": _s(getattr(w, "poa_w_m2", 0.0)),
-            "dlr_a": _s(clr_result["dlr_a"]),
+            "dlr_a": _s(dlr_op_a),
             "dlr_static_a": _s(static_fixed_a),
             "dlr_emergency_100c_a": _s(dlr_emerg),
-            "dlr_mw": _s(amps_to_mw(clr_result["dlr_a"], kv, pf)),
+            "dlr_mw": _s(amps_to_mw(dlr_op_a, kv, pf)),
             "binding_constraint": clr_result["binding"],
             "temperature_c": actual_temp,
             "sag_m": _s(actual_sag),
             "clearance_m": _s(actual_clearance),
-            "dlr_temp_c": _s(clr_result["temp_c"]),
-            "dlr_sag_m": _s(clr_result["sag_m"]),
-            "dlr_clearance_m": _s(clr_result["clearance_m"]),
+            "dlr_temp_c": temp_op,
+            "dlr_sag_m": _s(sag_op),
+            "dlr_clearance_m": _s(clr_op),
             "source": getattr(w, "source", "unknown"),
         })
     return results
